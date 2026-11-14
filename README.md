@@ -25,7 +25,7 @@ your apps live, switch between setups (work, focus, gaming...) in a click.
 ## Quick start
 
 ```sh
-omarchy plugin add <repository-url> --enable
+omarchy plugin add https://github.com/Gijuxx9x/omarchy-display-presets.git --enable
 ```
 
 1. Arrange your windows across your screens the way you like.
@@ -35,7 +35,7 @@ omarchy plugin add <repository-url> --enable
 ## Install
 
 ```sh
-omarchy plugin add <repository-url> --enable
+omarchy plugin add https://github.com/Gijuxx9x/omarchy-display-presets.git --enable
 ```
 
 Then add the **Display-Presets.9x** widget to your bar from the bar settings
