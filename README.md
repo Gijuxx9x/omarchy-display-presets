@@ -210,6 +210,9 @@ Omarchy theme. The colors and the wallpaper in the screenshot above come from
 it, and it is the theme this plugin was built and tested with. The Caroline
 palette it is based on is by [ed](https://codeberg.org/ed).
 
+> Merci à vous pour ce magnifique thème que j'utilise tous les jours.
+> Salutations du sud de la France !
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
