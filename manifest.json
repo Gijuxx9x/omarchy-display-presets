@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "gijux9x.presets",
-  "name": "Display presets",
+  "name": "Display Preset.9x",
   "version": "1.0.0",
   "author": "gijux9x",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Display presets",
+    "displayName": "Display Preset.9x",
     "description": "Apply, capture and manage window layouts across all your screens.",
     "category": "Compositor",
     "aliases": [

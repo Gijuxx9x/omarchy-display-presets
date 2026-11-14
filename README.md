@@ -1,4 +1,4 @@
-# Display presets
+# Display Preset.9x
 
 One click puts your apps on the right screens. A preset says which apps go on
 which monitor. Applying it **reuses the matching windows that are already
@@ -14,7 +14,7 @@ that does the window work through `hyprctl`.
 omarchy plugin add <repository-url> --enable
 ```
 
-Then add the **Display presets** widget to your bar from the bar settings
+Then add the **Display Preset.9x** widget to your bar from the bar settings
 (category *Compositor*), or open the panel from a keybinding (see below).
 
 To remove it: `omarchy plugin remove gijux9x.presets`.
@@ -64,7 +64,7 @@ The panel can be driven from the shell, so you can bind it in
 `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + ALT + P", "Display presets", "omarchy-shell gijux9x.presets toggle")
+o.bind("SUPER + ALT + P", "Display Preset.9x", "omarchy-shell gijux9x.presets toggle")
 o.bind("SUPER + ALT + 1", "Preset: work",    "presetctl apply work --notify")
 ```
 

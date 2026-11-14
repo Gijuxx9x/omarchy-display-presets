@@ -1,6 +1,6 @@
 {
-  "bar.tooltip": "Presets d'écran",
-  "title": "Presets d'écran",
+  "bar.tooltip": "Display Preset.9x",
+  "title": "Display Preset.9x",
   "screens": {
     "one": "%1 écran",
     "other": "%1 écrans"
