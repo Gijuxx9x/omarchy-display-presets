@@ -4,9 +4,9 @@
 A multi-monitor layout manager for [Omarchy](https://omarchy.org): save where
 your apps live, switch between setups (work, focus, gaming...) in a click.
 
-<!-- Add once media/panel.png exists:
-![The Display-Presets.9x panel listing three presets](media/panel.png)
--->
+<p align="center">
+  <img src="media/panel.png" alt="The Display-Presets.9x panel listing two presets, each showing which apps go on the left, middle and right screens" width="460">
+</p>
 
 - **Smart apply:** reuses windows that are already open and moves them to the
   right screen. It only launches what is missing, so pressing a preset twice
