@@ -1,0 +1,1596 @@
+#!/usr/bin/env python3
+"""presetctl - display presets for Hyprland (Omarchy).
+
+A preset says which apps go on which screen. Applying it reuses the matching
+windows that are already open (moving them where they belong) and launches
+only what is missing, so pressing the same preset twice changes nothing.
+
+    presetctl list [--json]          presets, screens, and what is open now
+    presetctl apply <id> [--dry-run] [--json] [--notify]
+    presetctl capture [--name NAME]  save the current layout as a new preset
+    presetctl delete <id>
+    presetctl rename <id> <name>     presetctl move <id> <+1|-1>
+    presetctl new [--name NAME]      create an empty preset (to fill in the editor)
+    presetctl show <id> --json       a preset as the editor sees it, per screen
+    presetctl save <id> --data JSON  write what the editor changed
+    presetctl restore-hidden        bring back windows a preset minimized
+    presetctl monitors               how screen names resolve on this machine
+    presetctl path                   print the presets file path
+
+A screen lists its apps (Hyprland tiles them as it sees fit), or gives "tiles":
+a tree of splits that pins every window to a place (see README, "Free layout").
+
+The presets file is ~/.config/omarchy-presets/presets.json (override with
+PRESETCTL_CONFIG). Only the Python standard library and hyprctl are used.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+
+CONFIG_PATH = os.environ.get("PRESETCTL_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "omarchy-presets",
+    "presets.json",
+)
+
+MINIMIZED_WORKSPACE = "special:minimized"
+MINIMIZED_TAG_PREFIX = "omarchy-minimized-from-"
+DEFAULT_TIMEOUT = 20.0
+POLL_INTERVAL = 0.25
+MAX_COUNT = 12
+LAYOUTS = ("dwindle", "scrolling", "floating")
+SPLITS = ("right", "down")     # where the "b" side of a split goes, relative to "a"
+PRESELECT = {"right": "r", "down": "d"}
+MAX_TILES = 16
+MAX_DEPTH = 10
+PARK_WORKSPACE = "special:presets-park"
+MATCH_TOLERANCE = 0.05
+
+# Screen keys a preset may use, in English or French.
+POSITION_ALIASES = {
+    "left": "left", "gauche": "left",
+    "middle": "middle", "center": "middle", "centre": "middle", "milieu": "middle", "main": "middle",
+    "right": "right", "droite": "right",
+}
+
+# Tokens that only wrap the real program in an exec line.
+WRAPPERS = {"uwsm-app", "uwsm", "app", "--", "setsid", "exec", "env", "nohup", "systemd-run", "-f", "--fork"}
+TERMINAL_CLASS_FLAGS = {
+    "foot": ("-a", "--app-id"),
+    "footclient": ("-a", "--app-id"),
+    "alacritty": ("--class",),
+    "kitty": ("--class",),
+    "ghostty": ("--class",),
+    "wezterm": ("--class",),
+}
+
+
+class PresetError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Hyprland access
+# --------------------------------------------------------------------------
+
+class Hyprland:
+    """Thin wrapper over hyprctl. Tests replace it with a fake."""
+
+    def __init__(self, dry_run=False, log=None):
+        self.dry_run = dry_run
+        self.log = log or (lambda msg: None)
+        self.dispatched = []
+
+    def _json(self, what):
+        try:
+            out = subprocess.run(["hyprctl", what, "-j"], capture_output=True, text=True, timeout=5)
+        except FileNotFoundError:
+            raise PresetError("hyprctl not found: is Hyprland running?")
+        except subprocess.TimeoutExpired:
+            raise PresetError("hyprctl is not responding")
+        if out.returncode != 0:
+            raise PresetError("hyprctl %s failed: %s" % (what, out.stderr.strip()))
+        try:
+            return json.loads(out.stdout)
+        except ValueError:
+            raise PresetError("hyprctl %s returned an unreadable response" % what)
+
+    def monitors(self):
+        return self._json("monitors")
+
+    def clients(self):
+        return self._json("clients")
+
+    def workspaces(self):
+        return self._json("workspaces")
+
+    def workspace_layout(self, workspace):
+        """dwindle, scrolling or floating as Omarchy reports it; "" when unknown."""
+        if not shutil.which("omarchy-hyprland-workspace-layout-current"):
+            return ""
+        try:
+            return subprocess.run(["omarchy-hyprland-workspace-layout-current", str(workspace)],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def option_int(self, name):
+        """Integer value of a Hyprland option, or None when it cannot be read."""
+        try:
+            out = subprocess.run(["hyprctl", "getoption", "-j", name], capture_output=True, text=True, timeout=5)
+            return int(json.loads(out.stdout).get("int"))
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+            return None
+
+    def dispatch(self, lua):
+        self.dispatched.append(lua)
+        if self.dry_run:
+            self.log("[dry-run] " + lua)
+            return True
+        out = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True, timeout=5)
+        ok = out.returncode == 0 and out.stdout.strip().lower() in ("ok", "")
+        if not ok:
+            self.log("dispatch refused: %s -> %s" % (lua, (out.stdout + out.stderr).strip()))
+        return ok
+
+    def eval(self, lua):
+        self.dispatched.append(lua)
+        if self.dry_run:
+            self.log("[dry-run] eval " + lua)
+            return True
+        out = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True, timeout=5)
+        return out.returncode == 0
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+
+def lua_str(value):
+    """Quote a Python string as a Lua string literal."""
+    s = str(value)
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\0", "")
+    return '"' + s + '"'
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+def load_config(path=None):
+    path = path or CONFIG_PATH
+    if not os.path.exists(path):
+        return {"version": 1, "presets": []}, False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except ValueError as exc:
+        raise PresetError("presets.json is not valid JSON: %s" % exc)
+    except OSError as exc:
+        raise PresetError("cannot read %s: %s" % (path, exc))
+    if not isinstance(data, dict) or not isinstance(data.get("presets", []), list):
+        raise PresetError("presets.json must contain an object with a \"presets\" list")
+    data.setdefault("presets", [])
+    return data, True
+
+
+def save_config(data, path=None):
+    path = path or CONFIG_PATH
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    fd, tmp = tempfile.mkstemp(prefix=".presets-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def slugify(text):
+    text = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+    return text or "preset"
+
+
+def preset_id(preset, index):
+    return str(preset.get("id") or slugify(preset.get("name") or "preset-%d" % (index + 1)))
+
+
+def find_preset(data, wanted):
+    wanted = str(wanted)
+    presets = data.get("presets", [])
+    for i, p in enumerate(presets):
+        if preset_id(p, i) == wanted:
+            return i, p
+    for i, p in enumerate(presets):
+        if slugify(p.get("name", "")) == slugify(wanted):
+            return i, p
+    if wanted.isdigit() and 1 <= int(wanted) <= len(presets):
+        return int(wanted) - 1, presets[int(wanted) - 1]
+    raise PresetError("preset not found: %s" % wanted)
+
+
+def preset_screens(preset):
+    """[(key, screen_dict)] in file order, accepting a dict or a list."""
+    screens = preset.get("screens") or {}
+    out = []
+    if isinstance(screens, dict):
+        for key, screen in screens.items():
+            out.append((str(key), screen if isinstance(screen, dict) else {"apps": screen}))
+    elif isinstance(screens, list):
+        for i, screen in enumerate(screens):
+            if isinstance(screen, dict):
+                out.append((str(screen.get("screen", i + 1)), screen))
+    return out
+
+
+def screen_apps(screen):
+    if isinstance(screen.get("tiles"), dict) and screen["tiles"]:
+        # A tile tree owns the screen: one window per tile, in tree order.
+        return [dict(a, count=1) for a in tile_leaves(screen["tiles"])]
+    apps = screen.get("apps") or []
+    if isinstance(apps, dict):
+        apps = [apps]
+    return [a for a in apps if isinstance(a, dict)]
+
+
+def is_split(node):
+    return isinstance(node, dict) and "split" in node
+
+
+def tile_leaves(node):
+    """The apps of a tile tree, "a" side first (the order windows are claimed in)."""
+    if is_split(node):
+        return tile_leaves(node.get("a")) + tile_leaves(node.get("b"))
+    return [node] if isinstance(node, dict) else []
+
+
+def split_ratio(node):
+    try:
+        ratio = float(node.get("ratio", 0.5))
+    except (TypeError, ValueError):
+        ratio = 0.5
+    return max(0.1, min(0.9, ratio))
+
+
+def tile_rects(node, x=0.0, y=0.0, w=1.0, h=1.0):
+    """[(leaf, (x, y, w, h))] with every tile as a fraction of its screen."""
+    if not is_split(node):
+        return [(node, (x, y, w, h))]
+    r = split_ratio(node)
+    if node.get("split") == "down":
+        return tile_rects(node["a"], x, y, w, h * r) + tile_rects(node["b"], x, y + h * r, w, h * (1 - r))
+    return tile_rects(node["a"], x, y, w * r, h) + tile_rects(node["b"], x + w * r, y, w * (1 - r), h)
+
+
+def clean_tree(node):
+    """Validate a tile tree from the file or the editor and return a tidy copy."""
+    leaves = [0]
+
+    def walk(n, depth):
+        if depth > MAX_DEPTH:
+            raise PresetError("the layout is nested too deeply")
+        if not isinstance(n, dict):
+            raise PresetError("invalid tile in the layout")
+        if "split" in n:
+            if n["split"] not in SPLITS:
+                raise PresetError("\"split\" must be %s" % " or ".join(SPLITS))
+            if "a" not in n or "b" not in n:
+                raise PresetError("a split needs both \"a\" and \"b\"")
+            out = {"split": n["split"]}
+            ratio = split_ratio(n)
+            if abs(ratio - 0.5) > 0.0005:
+                out["ratio"] = round(ratio, 3)
+            out["a"] = walk(n["a"], depth + 1)
+            out["b"] = walk(n["b"], depth + 1)
+            return out
+        leaves[0] += 1
+        if leaves[0] > MAX_TILES:
+            raise PresetError("too many tiles (%d at most)" % MAX_TILES)
+        app = clean_app(n)
+        app.pop("count", None)
+        return app
+
+    return walk(node, 0)
+
+
+def app_count(app):
+    try:
+        n = int(app.get("count", 1))
+    except (TypeError, ValueError):
+        n = 1
+    return max(0, min(MAX_COUNT, n))
+
+
+# --------------------------------------------------------------------------
+# Monitors
+# --------------------------------------------------------------------------
+
+def sorted_monitors(monitors):
+    mons = [m for m in monitors if not m.get("disabled")]
+    return sorted(mons, key=lambda m: (m.get("x", 0), m.get("y", 0), m.get("name", "")))
+
+
+def position_names(n):
+    if n == 1:
+        return ["middle"]
+    if n == 2:
+        return ["left", "right"]
+    if n == 3:
+        return ["left", "middle", "right"]
+    return [str(i + 1) for i in range(n)]
+
+
+def monitor_label(m):
+    model = (m.get("model") or "").strip()
+    if model:
+        return model
+    desc = (m.get("description") or "").strip()
+    return desc or m.get("name", "?")
+
+
+def resolve_screen(key, mons):
+    """Map a screen key to a monitor dict (mons sorted left to right)."""
+    if not mons:
+        return None
+    raw = str(key).strip()
+    low = raw.lower()
+    for m in mons:
+        if m.get("name", "").lower() == low:
+            return m
+    if low.startswith("desc:"):
+        needle = low[5:].strip()
+        for m in mons:
+            if needle and needle in (m.get("description") or "").lower():
+                return m
+        return None
+    if low.isdigit():
+        i = int(low) - 1
+        return mons[i] if 0 <= i < len(mons) else None
+    pos = POSITION_ALIASES.get(low)
+    if pos:
+        n = len(mons)
+        if pos == "left":
+            return mons[0]
+        if pos == "right":
+            return mons[-1]
+        # With an even count there is no true middle; take the left one of the pair.
+        return mons[(n - 1) // 2]
+    if len(low) >= 2:
+        for m in mons:
+            if low in (m.get("description") or "").lower():
+                return m
+    return None
+
+
+def monitor_by_id(monitors):
+    return {m.get("id"): m for m in monitors}
+
+
+# --------------------------------------------------------------------------
+# Matching windows to apps
+# --------------------------------------------------------------------------
+
+def webapp_class(url):
+    """Class Chromium gives an --app window (mirrors omarchy-webapp-window-class)."""
+    address = url.split("://", 1)[1] if "://" in url else url
+    address = re.split(r"[?#]", address, maxsplit=1)[0]
+    host, _, rest = address.partition("/")
+    path = "/" + rest if _ else ""
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+    return ("chrome-%s_%s-Default" % (host, path or "/")).replace("/", "_")
+
+
+def exec_tokens(command):
+    try:
+        return shlex.split(command or "")
+    except ValueError:
+        return (command or "").split()
+
+
+def derive_class(command):
+    """Best guess at the window class an exec line produces."""
+    tokens = exec_tokens(command)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        base = os.path.basename(tok)
+        if base in WRAPPERS or ("=" in tok and not tok.startswith("-")):
+            i += 1
+            continue
+        if tok.endswith(".desktop"):
+            return tok[: -len(".desktop")]
+        if base == "omarchy-launch-webapp" and i + 1 < len(tokens):
+            return webapp_class(tokens[i + 1])
+        if base in ("omarchy-launch-or-focus-webapp",) and i + 2 < len(tokens):
+            return webapp_class(tokens[i + 2])
+        flags = TERMINAL_CLASS_FLAGS.get(base)
+        if flags:
+            rest = tokens[i + 1:]
+            for j, arg in enumerate(rest):
+                for flag in flags:
+                    if arg == flag and j + 1 < len(rest):
+                        return rest[j + 1]
+                    if arg.startswith(flag + "="):
+                        return arg.split("=", 1)[1]
+                if arg in ("-e", "--"):
+                    break
+        return base
+    return ""
+
+
+def app_matcher(app):
+    """(class_regex, title_regex, class_hint) for an app entry."""
+    cls = app.get("class") or ""
+    title = app.get("title") or ""
+    hint = ""
+    if cls:
+        hint = re.sub(r"[\^\$\\]|\(\?i\)", "", cls)
+    else:
+        derived = derive_class(app.get("exec", ""))
+        if derived:
+            cls = "^" + re.escape(derived) + "$"
+            hint = derived
+    return cls, title, hint
+
+
+def compile_regex(pattern, what, app_name):
+    if not pattern:
+        return None
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise PresetError("invalid %s regex for \"%s\": %s" % (what, app_name, exc))
+
+
+def window_matches(window, cls_re, title_re):
+    if cls_re is None and title_re is None:
+        return False
+    klass = window.get("class") or ""
+    initial = window.get("initialClass") or ""
+    if cls_re is not None and not (cls_re.search(klass) or cls_re.search(initial)):
+        return False
+    if title_re is not None and not title_re.search(window.get("title") or ""):
+        return False
+    return True
+
+
+def window_tags(window):
+    return [str(t).rstrip("*") for t in (window.get("tags") or [])]
+
+
+def is_minimized(window):
+    return (window.get("workspace") or {}).get("name") == MINIMIZED_WORKSPACE
+
+
+def claimable(window):
+    """Regular windows, plus ones parked on Omarchy's minimized workspace."""
+    if not window.get("mapped", True):
+        return False
+    ws = window.get("workspace") or {}
+    if is_minimized(window):
+        return True
+    return isinstance(ws.get("id"), int) and ws.get("id") > 0
+
+
+# --------------------------------------------------------------------------
+# Planning
+# --------------------------------------------------------------------------
+
+def build_targets(preset, monitors):
+    """Resolve every screen of a preset to a monitor and a workspace."""
+    mons = sorted_monitors(monitors)
+    targets = []
+    unresolved = []
+    for key, screen in preset_screens(preset):
+        mon = resolve_screen(key, mons)
+        if mon is None:
+            unresolved.append(key)
+            continue
+        ws = screen.get("workspace")
+        explicit = ws not in (None, "", "active")
+        if explicit:
+            ws = str(ws)
+        else:
+            ws = str((mon.get("activeWorkspace") or {}).get("id", ""))
+        layout = screen.get("layout")
+        if layout and layout not in LAYOUTS:
+            raise PresetError("unknown layout \"%s\" (choices: %s)" % (layout, ", ".join(LAYOUTS)))
+        tree = clean_tree(screen["tiles"]) if screen.get("tiles") else None
+        if tree is not None and not layout:
+            # Pinning windows to places only means something in dwindle (a tree of
+            # splits). In scrolling they would be columns, some off the screen.
+            layout = "dwindle"
+        targets.append({
+            "key": key,
+            "monitor": mon,
+            "workspace": ws,
+            "explicit": explicit,
+            "layout": layout,
+            "apps": screen_apps(screen),
+            "tree": tree,
+        })
+    return targets, unresolved
+
+
+def build_slots(targets):
+    slots = []
+    for t_index, target in enumerate(targets):
+        for a_index, app in enumerate(target["apps"]):
+            name = app.get("name") or derive_class(app.get("exec", "")) or "app"
+            cls, title, hint = app_matcher(app)
+            cls_re = compile_regex(cls, "class", name)
+            title_re = compile_regex(title, "title", name)
+            for n in range(app_count(app)):
+                slots.append({
+                    "target": target,
+                    "app": app,
+                    "name": name,
+                    "cls_re": cls_re,
+                    "title_re": title_re,
+                    "hint": hint,
+                    "specific": 0 if title_re is not None else 1,
+                    "order": (t_index, a_index, n),
+                    "window": None,
+                })
+    return slots
+
+
+def window_rank(window, target):
+    ws = window.get("workspace") or {}
+    if str(ws.get("id")) == target["workspace"] or ws.get("name") == target["workspace"]:
+        return 0
+    if window.get("monitor") == target["monitor"].get("id") and not is_minimized(window):
+        return 1
+    if is_minimized(window):
+        return 3
+    return 2
+
+
+def claim_existing(slots, clients):
+    """Give each slot an open window, preferring ones already in place."""
+    taken = set()
+    windows = [w for w in clients if claimable(w)]
+    # Slots that name a title go first, so a generic "any Chrome" slot cannot
+    # keep the one Chrome window a "Docs" slot asks for. Within each group,
+    # pass 1 keeps windows already on their target workspace and pass 2 fills
+    # the rest from anywhere, nearest first.
+    for group in (0, 1):
+        ordered = sorted((s for s in slots if s["specific"] == group), key=lambda s: s["order"])
+        claim_group(ordered, windows, taken)
+    return taken
+
+
+def claim_group(ordered, windows, taken):
+    for max_rank in (0, 3):
+        for slot in ordered:
+            if slot["window"] is not None or not slot["app"].get("reuse", True):
+                continue
+            best = None
+            for w in windows:
+                if w["address"] in taken or not window_matches(w, slot["cls_re"], slot["title_re"]):
+                    continue
+                rank = window_rank(w, slot["target"])
+                if rank > max_rank:
+                    continue
+                key = (rank, w.get("focusHistoryID", 999))
+                if best is None or key < best[0]:
+                    best = (key, w)
+            if best is not None:
+                slot["window"] = best[1]
+                taken.add(best[1]["address"])
+    return taken
+
+
+# --------------------------------------------------------------------------
+# Applying
+# --------------------------------------------------------------------------
+
+def move_window(hypr, window, workspace):
+    if is_minimized(window):
+        for tag in window_tags(window):
+            if tag.startswith(MINIMIZED_TAG_PREFIX):
+                hypr.dispatch("hl.dsp.window.tag({ tag = %s, window = %s })" % (
+                    lua_str("-" + tag), lua_str("address:" + window["address"])))
+    return hypr.dispatch("hl.dsp.window.move({ workspace = %s, follow = false, window = %s })" % (
+        lua_str(workspace), lua_str("address:" + window["address"])))
+
+
+def show_workspace(hypr, target, workspaces):
+    """Make an explicit workspace the visible one on its monitor."""
+    mon = target["monitor"]["name"]
+    ws = target["workspace"]
+    current = next((w for w in workspaces if str(w.get("id")) == ws or w.get("name") == ws), None)
+    if current is not None and current.get("monitor") != mon:
+        hypr.dispatch("hl.dsp.workspace.move({ workspace = %s, monitor = %s })" % (lua_str(ws), lua_str(mon)))
+    hypr.dispatch("hl.dsp.focus({ monitor = %s })" % lua_str(mon))
+    hypr.dispatch("hl.dsp.focus({ workspace = %s })" % lua_str(ws))
+
+
+def set_layout(hypr, target):
+    ws = target["workspace"]
+    if not ws.isdigit():
+        return
+    current = "" if hypr.dry_run else hypr.workspace_layout(ws)
+    if current == target["layout"]:
+        return
+    hypr.eval("o.workspace_mode({ workspace = %s, mode = %s })" % (lua_str(ws), lua_str(target["layout"])))
+
+
+def launch(hypr, slot):
+    command = (slot["app"].get("exec") or "").strip()
+    if not command:
+        return False
+    rule = "[workspace %s silent] " % slot["target"]["workspace"]
+    return hypr.dispatch("hl.dsp.exec_cmd(%s)" % lua_str(rule + command))
+
+
+def annotate_tree(node, slots):
+    """Copy of a tile tree whose leaves carry their slot (taken from slots in order)."""
+    if is_split(node):
+        out = dict(node)
+        out["a"] = annotate_tree(node["a"], slots)
+        out["b"] = annotate_tree(node["b"], slots)
+        return out
+    return {"slot": slots.pop(0)}
+
+
+def prune_tree(node):
+    """Drop tiles whose window never showed up; the neighbour takes their space."""
+    if "slot" in node:
+        return node if node["slot"]["window"] is not None else None
+    a, b = prune_tree(node["a"]), prune_tree(node["b"])
+    if a is None or b is None:
+        return a or b
+    return dict(node, a=a, b=b)
+
+
+def first_window(node):
+    while "slot" not in node:
+        node = node["a"]
+    return node["slot"]["window"]
+
+
+def tree_matches(tree, clients, workspace):
+    """Are the windows already laid out like the tree, give or take the gaps?"""
+    leaves = [(n["slot"]["window"]["address"], r) for n, r in tile_rects(tree)]
+    by_addr = {w["address"]: w for w in clients}
+    wins = []
+    for addr, rect in leaves:
+        w = by_addr.get(addr)
+        if w is None or str((w.get("workspace") or {}).get("id")) != workspace or w.get("floating"):
+            return False
+        if not w.get("at") or not w.get("size"):
+            return False
+        wins.append((w, rect))
+    x0 = min(w["at"][0] for w, _ in wins)
+    y0 = min(w["at"][1] for w, _ in wins)
+    x1 = max(w["at"][0] + w["size"][0] for w, _ in wins)
+    y1 = max(w["at"][1] + w["size"][1] for w, _ in wins)
+    width, height = max(1, x1 - x0), max(1, y1 - y0)
+    for w, (rx, ry, rw, rh) in wins:
+        cx = (w["at"][0] + w["size"][0] / 2 - x0) / width
+        cy = (w["at"][1] + w["size"][1] / 2 - y0) / height
+        if abs(cx - (rx + rw / 2)) > MATCH_TOLERANCE or abs(cy - (ry + rh / 2)) > MATCH_TOLERANCE:
+            return False
+        if abs(w["size"][0] / width - rw) > MATCH_TOLERANCE * 1.5 or abs(w["size"][1] / height - rh) > MATCH_TOLERANCE * 1.5:
+            return False
+    return True
+
+
+def wait_for_dwindle(hypr, workspace, timeout=3.0):
+    """The workspace's tiled layout, after giving a switch to dwindle time to land."""
+    deadline = time.monotonic() + timeout
+    while True:
+        mode = next((w.get("tiledLayout") for w in hypr.workspaces()
+                     if str(w.get("id")) == workspace or w.get("name") == workspace), None)
+        if mode in (None, "dwindle") or time.monotonic() > deadline:
+            return mode
+        hypr.sleep(0.15)
+
+
+def arrange_target(hypr, target, slots, result, log):
+    """Pin the windows of one screen to its tile tree.
+
+    Hyprland's dwindle layout builds its tree from the order windows arrive in,
+    and "preselect" tells it where the next one goes. So the windows are put
+    aside, then brought back one by one: the first fills the workspace, and
+    every other lands beside the window that owns the region it splits.
+    """
+    mine = sorted((s for s in slots if s["target"] is target), key=lambda s: s["order"])
+    tree = prune_tree(annotate_tree(target["tree"], list(mine)))
+    if tree is None:
+        return
+    windows = [s["window"] for s in mine if s["window"] is not None]
+    workspace = target["workspace"]
+    if target["layout"] and target["layout"] != "dwindle":
+        result["warnings"].append("free layout: workspace %s is using %s, not dwindle" % (workspace, target["layout"]))
+        return
+    if len(windows) < 2:
+        return
+    if not hypr.dry_run:
+        mode = wait_for_dwindle(hypr, workspace)
+        if mode and mode != "dwindle":
+            result["warnings"].append("free layout: workspace %s is using %s, not dwindle" % (workspace, mode))
+            return
+        if hypr.option_int("dwindle:preserve_split") == 0:
+            result["warnings"].append("enable dwindle:preserve_split so the sizes keep their meaning")
+        if tree_matches(tree, hypr.clients(), workspace):
+            log("workspace %s is already laid out as requested" % workspace)
+            return
+
+    def focus(w):
+        hypr.dispatch("hl.dsp.focus({ window = %s })" % lua_str("address:" + w["address"]))
+
+    def put(w, where):
+        return hypr.dispatch("hl.dsp.window.move({ workspace = %s, follow = false, window = %s })" % (
+            lua_str(where), lua_str("address:" + w["address"])))
+
+    def build(node):
+        if "slot" in node:
+            return
+        anchor, other = first_window(node["a"]), first_window(node["b"])
+        focus(anchor)
+        hypr.dispatch("hl.dsp.layout(%s)" % lua_str("preselect " + PRESELECT[node["split"]]))
+        put(other, workspace)
+        delta = 2 * split_ratio(node) - 1
+        if abs(delta) >= 0.005:
+            focus(other)
+            hypr.dispatch("hl.dsp.layout(%s)" % lua_str("splitratio %.3f" % delta))
+        build(node["a"])
+        build(node["b"])
+
+    log("laying out %d windows on workspace %s" % (len(windows), workspace))
+    for w in windows:
+        put(w, PARK_WORKSPACE)
+    try:
+        put(first_window(tree), workspace)
+        build(tree)
+    finally:
+        # Whatever happens, nothing stays in the parking workspace.
+        if not hypr.dry_run:
+            for w in hypr.clients():
+                if (w.get("workspace") or {}).get("name") == PARK_WORKSPACE:
+                    put(w, workspace)
+
+
+def apply_preset(preset, hypr, timeout=None, log=None):
+    log = log or (lambda msg: None)
+    monitors = hypr.monitors()
+    clients = hypr.clients()
+    targets, unresolved = build_targets(preset, monitors)
+    if not targets:
+        raise PresetError("none of this preset's screens matches a connected monitor")
+    slots = build_slots(targets)
+    # Arranging tiles has to focus windows; the user's own focus is put back after.
+    active = next((w for w in clients if w.get("focusHistoryID") == 0 and not is_minimized(w)), None)
+    result = {"ok": True, "moved": 0, "launched": 0, "kept": 0, "hidden": 0,
+              "missing": [], "warnings": [], "unresolved": unresolved}
+    for key in unresolved:
+        result["warnings"].append("screen \"%s\" not found, skipped" % key)
+
+    # 1. Show the requested workspaces and set their layouts first, so windows
+    #    land on what the user will actually see.
+    explicit = [t for t in targets if t["explicit"]]
+    if explicit:
+        workspaces = hypr.workspaces()
+        for t in explicit:
+            show_workspace(hypr, t, workspaces)
+    for t in targets:
+        if t["layout"]:
+            set_layout(hypr, t)
+
+    # 2. Reuse windows that are already open.
+    taken = claim_existing(slots, clients)
+    for slot in slots:
+        w = slot["window"]
+        if w is None:
+            continue
+        if window_rank(w, slot["target"]) == 0:
+            result["kept"] += 1
+            continue
+        log("moving %s -> workspace %s" % (slot["name"], slot["target"]["workspace"]))
+        if move_window(hypr, w, slot["target"]["workspace"]):
+            result["moved"] += 1
+
+    # 3. Put away everything else on the target workspaces if asked to.
+    if preset.get("others") == "minimize":
+        target_ws = {t["workspace"] for t in targets}
+        for w in clients:
+            ws = w.get("workspace") or {}
+            if w["address"] in taken or not claimable(w) or is_minimized(w):
+                continue
+            if str(ws.get("id")) in target_ws:
+                hypr.dispatch("hl.dsp.window.tag({ tag = %s, window = %s })" % (
+                    lua_str("+" + MINIMIZED_TAG_PREFIX + str(ws.get("id"))), lua_str("address:" + w["address"])))
+                hypr.dispatch("hl.dsp.window.move({ workspace = %s, follow = false, window = %s })" % (
+                    lua_str(MINIMIZED_WORKSPACE), lua_str("address:" + w["address"])))
+                result["hidden"] += 1
+
+    # 4. Launch what is missing, then wait for the windows and put them in place.
+    pending = []
+    for slot in slots:
+        if slot["window"] is None:
+            if not (slot["app"].get("exec") or "").strip():
+                result["warnings"].append("\"%s\" has no exec command" % slot["name"])
+                continue
+            log("launching %s on workspace %s" % (slot["name"], slot["target"]["workspace"]))
+            if launch(hypr, slot):
+                result["launched"] += 1
+                pending.append(slot)
+            else:
+                result["missing"].append(slot["name"])
+
+    known = {w["address"] for w in clients}
+    trackable = [s for s in pending if s["cls_re"] is not None or s["title_re"] is not None]
+    if trackable and not hypr.dry_run:
+        limit = float(timeout if timeout is not None else preset.get("timeout", DEFAULT_TIMEOUT))
+        deadline = time.monotonic() + max(1.0, limit)
+        while trackable and time.monotonic() < deadline:
+            hypr.sleep(POLL_INTERVAL)
+            for w in hypr.clients():
+                if w["address"] in known or not claimable(w):
+                    continue
+                slot = next((s for s in trackable if window_matches(w, s["cls_re"], s["title_re"])), None)
+                if slot is None:
+                    continue
+                known.add(w["address"])
+                trackable.remove(slot)
+                slot["window"] = w
+                if window_rank(w, slot["target"]) != 0:
+                    move_window(hypr, w, slot["target"]["workspace"])
+        for slot in trackable:
+            result["missing"].append(slot["name"])
+
+    # 5. Pin the windows of screens that came with a tile tree.
+    for t in targets:
+        if t["tree"] is not None:
+            arrange_target(hypr, t, slots, result, log)
+
+    # 6. Focus the screen the preset names, or give the focus back.
+    focus = preset.get("focus")
+    mon = resolve_screen(focus, sorted_monitors(monitors)) if focus else None
+    if mon is not None:
+        hypr.dispatch("hl.dsp.focus({ monitor = %s })" % lua_str(mon["name"]))
+    elif active is not None and any(t["tree"] is not None for t in targets):
+        hypr.dispatch("hl.dsp.focus({ window = %s })" % lua_str("address:" + active["address"]))
+
+    if result["missing"]:
+        result["ok"] = False
+        result["warnings"].append("did not appear in time: " + ", ".join(result["missing"]))
+    if not hypr.dry_run and any(t["layout"] for t in targets) and shutil.which("omarchy-shell"):
+        subprocess.run(["omarchy-shell", "-q", "omarchy.workspaces", "refresh"], capture_output=True, timeout=5)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Listing (what the bar panel shows)
+# --------------------------------------------------------------------------
+
+def layout_tiles(windows, aspect, mode=""):
+    """Where each window lands on its screen, in 0..1 coordinates.
+
+    A sketch of Hyprland's layouts for the preview: dwindle halves the
+    remaining space along its longer side for every new window, scrolling
+    puts windows side by side in columns, floating cascades them.
+    """
+    n = len(windows)
+    rects = []
+    if n == 0:
+        return []
+    if mode == "scrolling":
+        rects = [(i / n, 0.0, 1.0 / n, 1.0) for i in range(n)]
+    elif mode == "floating":
+        step = 0.08 if n > 1 else 0.0
+        size = max(0.4, 0.7 - step * (n - 1))
+        rects = [(0.15 + step * i, 0.15 + step * i, size, size) for i in range(n)]
+    else:
+        x, y, w, h = 0.0, 0.0, 1.0, 1.0
+        for i in range(n):
+            if i == n - 1:
+                rects.append((x, y, w, h))
+            elif w * aspect >= h:
+                rects.append((x, y, w / 2, h))
+                x, w = x + w / 2, w / 2
+            else:
+                rects.append((x, y, w, h / 2))
+                y, h = y + h / 2, h / 2
+    out = []
+    for win, (x, y, w, h) in zip(windows, rects):
+        tile = dict(win)
+        tile.update({"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)})
+        out.append(tile)
+    return out
+
+
+def app_library(data):
+    """Commands the picker offers beside the installed apps.
+
+    Every app already used by a preset (flat or tile) is reusable, so a command
+    typed once, like Claude Code in a foot terminal, is one click away from then on.
+    Apps listed under a top-level "apps" key come first. Claude Code is suggested
+    when it is installed and nothing mentions it yet.
+    """
+    seen, out = {}, []
+
+    def add(app):
+        if not isinstance(app, dict) or not str(app.get("exec") or "").strip():
+            return
+        command = " ".join(str(app["exec"]).split())
+        key = (command, str(app.get("title") or ""))
+        extra = {k: app[k] for k in ("class", "icon") if app.get(k)}
+        if key in seen:
+            # The same command again (say with its window class filled in): keep the richer entry.
+            for k, v in extra.items():
+                seen[key].setdefault(k, v)
+            return
+        entry = {k: app[k] for k in ("name", "title") if app.get(k)}
+        entry.update(extra)
+        entry["exec"] = command
+        entry.setdefault("name", derive_class(command) or "app")
+        seen[key] = entry
+        out.append(entry)
+
+    saved = data.get("apps")
+    for app in saved if isinstance(saved, list) else []:
+        add(app)
+    for preset in data.get("presets", []):
+        for _, screen in preset_screens(preset):
+            for app in screen_apps(screen):
+                add(app)
+    if shutil.which("claude") and not any("claude" in a["exec"].lower() for a in out):
+        add({"name": "Claude Code", "icon": "claude-desktop",
+             "exec": "foot --app-id=claude-code --working-directory=$HOME bash -c 'claude; exec bash'"})
+    return out
+
+
+def describe(data, monitors, clients, exists, path=None):
+    path = path or CONFIG_PATH
+    mons = sorted_monitors(monitors)
+    names = position_names(len(mons))
+    mon_out = []
+    for i, m in enumerate(mons):
+        scale = m.get("scale") or 1
+        w, h = m.get("width", 1920) / scale, m.get("height", 1080) / scale
+        if m.get("transform", 0) in (1, 3, 5, 7):
+            w, h = h, w
+        mon_out.append({
+            "name": m.get("name"),
+            "label": monitor_label(m),
+            "position": names[i],
+            "width": round(w),
+            "height": round(h),
+            "focused": bool(m.get("focused")),
+            "workspace": (m.get("activeWorkspace") or {}).get("id"),
+        })
+
+    presets_out = []
+    for index, preset in enumerate(data.get("presets", [])):
+        entry = {
+            "id": preset_id(preset, index),
+            "name": str(preset.get("name") or preset_id(preset, index)),
+            "icon": str(preset.get("icon") or ""),
+            "description": str(preset.get("description") or ""),
+            "index": index + 1,
+            "others": preset.get("others", "keep"),
+            "error": "",
+            "active": False,
+            "unresolved": [],
+            "screens": [{"monitor": m["name"], "workspace": None, "layout": "", "free": False,
+                         "apps": [], "tiles": []} for m in mon_out],
+        }
+        try:
+            targets, unresolved = build_targets(preset, monitors)
+            entry["unresolved"] = unresolved
+            active = bool(targets)
+            for t in targets:
+                column = next(s for s in entry["screens"] if s["monitor"] == t["monitor"]["name"])
+                if t["explicit"]:
+                    column["workspace"] = t["workspace"]
+                if t["layout"]:
+                    column["layout"] = t["layout"]
+                visible_ws = str((t["monitor"].get("activeWorkspace") or {}).get("id", ""))
+                if t["explicit"] and t["workspace"] != visible_ws:
+                    active = False
+                column["free"] = t["tree"] is not None
+                seen = {}
+                for app in t["apps"]:
+                    name = app.get("name") or derive_class(app.get("exec", "")) or "app"
+                    cls, title, hint = app_matcher(app)
+                    cls_re = compile_regex(cls, "class", name)
+                    title_re = compile_regex(title, "title", name)
+                    present = sum(
+                        1 for w in clients
+                        if claimable(w) and not is_minimized(w)
+                        and str((w.get("workspace") or {}).get("id")) == t["workspace"]
+                        and window_matches(w, cls_re, title_re))
+                    count = app_count(app)
+                    if t["tree"] is not None:
+                        # Tiles are one window each: identical tiles share the windows that exist.
+                        nth = seen.get((cls, title), 0)
+                        seen[(cls, title)] = nth + 1
+                        present = 1 if nth < present else 0
+                    if present < count:
+                        active = False
+                    column["apps"].append({
+                        "name": str(name),
+                        "count": count,
+                        "present": min(present, count),
+                        "icon": str(app.get("icon") or hint),
+                    })
+                column["rects"] = [r for _, r in tile_rects(t["tree"])] if t["tree"] is not None else None
+            entry["active"] = active and not unresolved
+            for column, mon in zip(entry["screens"], mon_out):
+                windows = []
+                for app in column["apps"]:
+                    for n in range(app["count"]):
+                        windows.append({"name": app["name"], "icon": app["icon"], "present": n < app["present"]})
+                if column.get("rects"):
+                    column["tiles"] = []
+                    for win, (x, y, w, h) in zip(windows, column["rects"]):
+                        tile = dict(win)
+                        tile.update({"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)})
+                        column["tiles"].append(tile)
+                else:
+                    column["tiles"] = layout_tiles(windows, mon["width"] / max(1, mon["height"]), column["layout"])
+                column.pop("rects", None)
+        except PresetError as exc:
+            entry["error"] = str(exc)
+        presets_out.append(entry)
+
+    hidden = sum(1 for w in clients if is_minimized(w)
+                 and any(t.startswith(MINIMIZED_TAG_PREFIX) for t in window_tags(w)))
+    return {"config": path, "exists": exists, "error": "", "monitors": mon_out,
+            "presets": presets_out, "hidden": hidden, "library": app_library(data)}
+
+
+# --------------------------------------------------------------------------
+# Capture
+# --------------------------------------------------------------------------
+
+def desktop_dirs():
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    dirs = [home] + (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    return [os.path.join(d, "applications") for d in dirs if d]
+
+
+def desktop_entry_for_class(klass):
+    """{exec, name, icon} of the desktop entry that claims a window class."""
+    if not klass:
+        return {}
+    wanted = klass.lower()
+    for directory in desktop_dirs():
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".desktop"):
+                continue
+            fields = {}
+            try:
+                with open(os.path.join(directory, name), encoding="utf-8", errors="replace") as fh:
+                    section = ""
+                    for line in fh:
+                        line = line.strip()
+                        if line.startswith("["):
+                            section = line
+                        elif section == "[Desktop Entry]" and "=" in line:
+                            k, v = line.split("=", 1)
+                            fields.setdefault(k.strip(), v.strip())
+            except OSError:
+                continue
+            wm = fields.get("StartupWMClass", "").lower()
+            if wm == wanted or name[: -len(".desktop")].lower() == wanted:
+                command = re.sub(r"\s*%[fFuUdDnNickvm]", "", fields.get("Exec", "")).strip()
+                if command:
+                    return {"exec": command, "name": fields.get("Name", ""), "icon": fields.get("Icon", "")}
+    return {}
+
+
+def proc_cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
+            parts = [p.decode("utf-8", "replace") for p in fh.read().split(b"\0") if p]
+    except (OSError, ValueError, TypeError):
+        return ""
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def app_from_window(window):
+    klass = window.get("class") or window.get("initialClass") or ""
+    entry = desktop_entry_for_class(klass)
+    command = entry.get("exec") or proc_cmdline(window.get("pid")) or klass
+    name = entry.get("name") or (klass[len("chrome-"):].split("_")[0] if klass.startswith("chrome-") else klass)
+    app = {"name": name, "exec": command, "class": "^" + re.escape(klass) + "$", "count": 1}
+    if entry.get("icon"):
+        app["icon"] = entry["icon"]
+    return app
+
+
+def capture(monitors, clients, name=None):
+    mons = sorted_monitors(monitors)
+    names = position_names(len(mons))
+    screens = {}
+    for i, m in enumerate(mons):
+        ws = (m.get("activeWorkspace") or {}).get("id")
+        here = [w for w in clients
+                if claimable(w) and not is_minimized(w)
+                and (w.get("workspace") or {}).get("id") == ws
+                and (w.get("class") or w.get("initialClass"))]
+        here.sort(key=lambda w: ((w.get("at") or [0, 0])[0], (w.get("at") or [0, 0])[1]))
+        apps = []
+        for w in here:
+            app = app_from_window(w)
+            same = next((a for a in apps if a["class"] == app["class"] and a["exec"] == app["exec"]), None)
+            if same:
+                same["count"] += 1
+            else:
+                apps.append(app)
+        if apps:
+            screens[names[i]] = {"apps": apps}
+    if not screens:
+        raise PresetError("no visible window to capture")
+    label = name or "Disposition " + datetime.datetime.now().strftime("%d/%m %H:%M")
+    return {"name": label, "icon": "", "focus": None, "screens": screens}
+
+
+def unique_id(data, base):
+    existing = {preset_id(p, i) for i, p in enumerate(data.get("presets", []))}
+    candidate, n = base, 2
+    while candidate in existing:
+        candidate = "%s-%d" % (base, n)
+        n += 1
+    return candidate
+
+
+# --------------------------------------------------------------------------
+# Editing (what the panel's editor reads and writes)
+# --------------------------------------------------------------------------
+
+APP_FIELDS = ("name", "exec", "count", "class", "title", "icon", "reuse")
+OTHERS_VALUES = ("keep", "minimize")
+
+
+def clean_app(raw):
+    """Validate one app coming from the editor; returns a dict ready for the file."""
+    if not isinstance(raw, dict):
+        raise PresetError("invalid app")
+    command = " ".join(str(raw.get("exec") or "").split())
+    if not command:
+        raise PresetError("an app has no command")
+    app = {}
+    for key, value in raw.items():
+        if key not in APP_FIELDS or value in (None, ""):
+            continue
+        app[key] = value
+    app["exec"] = command
+    app["name"] = " ".join(str(raw.get("name") or "").split())[:60] or derive_class(command) or "app"
+    count = app_count(raw)
+    if count <= 1:
+        app.pop("count", None)
+    else:
+        app["count"] = count
+    if app.get("reuse") is not False:
+        app.pop("reuse", None)
+    for key in ("class", "title"):
+        if key in app:
+            app[key] = str(app[key])
+            compile_regex(app[key], key, app["name"])
+    return app
+
+
+def editable(data, monitors, wanted):
+    """The preset laid out per connected screen, with its full app entries."""
+    index, preset = find_preset(data, wanted)
+    mons = sorted_monitors(monitors)
+    names = position_names(len(mons))
+    columns = [{"position": names[i], "monitor": m.get("name"), "label": monitor_label(m),
+                "key": None, "workspace": None, "layout": "", "apps": [], "tiles": None}
+               for i, m in enumerate(mons)]
+    unresolved = []
+    for key, screen in preset_screens(preset):
+        mon = resolve_screen(key, mons)
+        if mon is None:
+            unresolved.append(key)
+            continue
+        column = columns[mons.index(mon)]
+        if column["key"] is None:
+            column["key"] = key
+            column["workspace"] = screen.get("workspace")
+            column["layout"] = screen.get("layout") or ""
+        # Two keys can point at one screen (say "left" and "DP-1"): show their apps together.
+        if isinstance(screen.get("tiles"), dict) and screen["tiles"]:
+            if column["tiles"] is None:
+                column["tiles"] = clean_tree(screen["tiles"])
+        else:
+            column["apps"] = column["apps"] + screen_apps(screen)
+    focus = ""
+    if preset.get("focus"):
+        mon = resolve_screen(preset["focus"], mons)
+        if mon is not None:
+            focus = names[mons.index(mon)]
+    return {
+        "id": preset_id(preset, index),
+        "name": str(preset.get("name") or preset_id(preset, index)),
+        "description": str(preset.get("description") or ""),
+        "others": "minimize" if preset.get("others") == "minimize" else "keep",
+        "focus": focus,
+        "screens": columns,
+        "unresolved": unresolved,
+    }
+
+
+def apply_edit(data, monitors, wanted, edit):
+    """Write the editor's changes into data (in place) and return the preset."""
+    if not isinstance(edit, dict):
+        raise PresetError("invalid editor data")
+    index, preset = find_preset(data, wanted)
+    preset["id"] = preset_id(preset, index)
+    mons = sorted_monitors(monitors)
+    names = position_names(len(mons))
+
+    if "name" in edit:
+        name = " ".join(str(edit["name"]).split())[:60]
+        if not name:
+            raise PresetError("the name is empty")
+        preset["name"] = name
+    if "description" in edit:
+        description = " ".join(str(edit["description"]).split())[:200]
+        if description:
+            preset["description"] = description
+        else:
+            preset.pop("description", None)
+    if "others" in edit:
+        if edit["others"] not in OTHERS_VALUES:
+            raise PresetError("\"others\" must be keep or minimize")
+        if edit["others"] == "minimize":
+            preset["others"] = "minimize"
+        else:
+            preset.pop("others", None)
+
+    if "screens" in edit:
+        incoming = edit["screens"]
+        if not isinstance(incoming, dict):
+            raise PresetError("\"screens\" must be an object of position -> apps")
+        old = preset_screens(preset)
+        new = {}
+        used_keys = set()
+        # Keep every key we are not editing (screens not plugged in, odd aliases) as it was.
+        for key, screen in old:
+            mon = resolve_screen(key, mons)
+            if mon is None:
+                new[key] = screen
+                used_keys.add(key)
+        for i, mon in enumerate(mons):
+            position = names[i]
+            if position not in incoming:
+                for key, screen in old:
+                    if resolve_screen(key, mons) is mon and key not in used_keys:
+                        new[key] = screen
+                        used_keys.add(key)
+                        break
+                continue
+            value = incoming[position]
+            if isinstance(value, dict):
+                apps, tiles = value.get("apps") or [], value.get("tiles")
+            else:
+                apps, tiles = value, None
+            if not isinstance(apps, list):
+                raise PresetError("the apps of \"%s\" must be a list" % position)
+            apps = [clean_app(a) for a in apps]
+            tiles = clean_tree(tiles) if tiles else None
+            existing_key, existing = next(
+                ((k, sc) for k, sc in old if resolve_screen(k, mons) is mon and k not in used_keys), (None, {}))
+            screen = {k: v for k, v in existing.items() if k not in ("apps", "tiles")}
+            if not apps and not tiles and not screen:
+                continue
+            if tiles:
+                screen["tiles"] = tiles    # a tile tree replaces the flat list
+            else:
+                screen["apps"] = apps
+            key = existing_key if existing_key is not None else position
+            used_keys.add(key)
+            new[key] = screen
+        preset["screens"] = new
+
+    if "focus" in edit:
+        wanted_focus = str(edit["focus"] or "")
+        current = ""
+        if preset.get("focus"):
+            mon = resolve_screen(preset["focus"], mons)
+            if mon is not None:
+                current = names[mons.index(mon)]
+        if wanted_focus != current:
+            if not wanted_focus:
+                preset.pop("focus", None)
+            elif wanted_focus in names:
+                preset["focus"] = wanted_focus
+            else:
+                raise PresetError("unknown screen for focus: %s" % wanted_focus)
+    return preset
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def notify(summary, body="", urgent=False):
+    for tool in ("omarchy-notification-send", "notify-send"):
+        if shutil.which(tool):
+            cmd = [tool]
+            if urgent:
+                cmd += ["-u", "critical"]
+            subprocess.run(cmd + [summary, body], capture_output=True, timeout=5)
+            return
+
+
+def cmd_list(args):
+    hypr = Hyprland()
+    try:
+        data, exists = load_config()
+        error = ""
+    except PresetError as exc:
+        data, exists, error = {"presets": []}, True, str(exc)
+    out = describe(data, hypr.monitors(), hypr.clients(), exists)
+    out["error"] = error
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    if error:
+        print("! " + error)
+    print("Screens: " + "  ".join("%s=%s (%s)" % (m["position"], m["name"], m["label"]) for m in out["monitors"]))
+    if not out["presets"]:
+        print("No presets in %s" % out["config"])
+    for p in out["presets"]:
+        mark = "●" if p["active"] else "○"
+        print("%s %d. %s [%s]%s" % (mark, p["index"], p["name"], p["id"], "  ! " + p["error"] if p["error"] else ""))
+        for s in p["screens"]:
+            apps = ", ".join("%s%s" % (a["name"], " ×%d" % a["count"] if a["count"] > 1 else "") for a in s["apps"])
+            print("     %-9s %s" % (s["monitor"], apps or "—"))
+    return 0
+
+
+def cmd_apply(args):
+    log = (lambda msg: print(msg, file=sys.stderr)) if (args.verbose or args.dry_run) else None
+    hypr = Hyprland(dry_run=args.dry_run, log=log)
+    data, _ = load_config()
+    _, preset = find_preset(data, args.preset)
+    result = apply_preset(preset, hypr, timeout=args.timeout, log=log)
+    result["preset"] = preset.get("name") or args.preset
+    if args.dry_run:
+        result["dispatched"] = hypr.dispatched
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print("%s: %d kept, %d moved, %d launched%s" % (
+            result["preset"], result["kept"], result["moved"], result["launched"],
+            ", %d hidden" % result["hidden"] if result["hidden"] else ""))
+        for w in result["warnings"]:
+            print("  ! " + w)
+    if args.notify and result["warnings"]:
+        notify("Preset \"%s\"" % result["preset"], "\n".join(result["warnings"]), urgent=not result["ok"])
+    return 0 if result["ok"] else 2
+
+
+def cmd_capture(args):
+    hypr = Hyprland()
+    data, _ = load_config()
+    preset = capture(hypr.monitors(), hypr.clients(), args.name)
+    preset = dict([("id", unique_id(data, slugify(preset["name"])))] + list(preset.items()))
+    if not preset.get("focus"):
+        preset.pop("focus", None)
+    data.setdefault("version", 1)
+    data["presets"].append(preset)
+    save_config(data)
+    if args.json:
+        print(json.dumps({"ok": True, "id": preset["id"], "name": preset["name"]}, ensure_ascii=False))
+    else:
+        print("Preset \"%s\" saved (%s)" % (preset["name"], preset["id"]))
+    return 0
+
+
+def cmd_new(args):
+    data, _ = load_config()
+    name = " ".join((args.name or "").split())[:60] or "Preset " + str(len(data["presets"]) + 1)
+    preset = {"id": unique_id(data, slugify(name)), "name": name, "screens": {}}
+    data.setdefault("version", 1)
+    data["presets"].append(preset)
+    save_config(data)
+    if args.json:
+        print(json.dumps({"ok": True, "id": preset["id"], "name": name}, ensure_ascii=False))
+    else:
+        print("Preset \"%s\" created (%s)" % (name, preset["id"]))
+    return 0
+
+
+def cmd_show(args):
+    data, _ = load_config()
+    out = editable(data, Hyprland().monitors(), args.preset)
+    print(json.dumps(out, ensure_ascii=False, indent=None if args.json else 2))
+    return 0
+
+
+def cmd_save(args):
+    try:
+        edit = json.loads(args.data)
+    except ValueError as exc:
+        raise PresetError("invalid JSON: %s" % exc)
+    data, exists = load_config()
+    if not exists:
+        raise PresetError("no presets file")
+    preset = apply_edit(data, Hyprland().monitors(), args.preset, edit)
+    save_config(data)
+    if args.json:
+        print(json.dumps({"ok": True, "id": preset["id"]}, ensure_ascii=False))
+    else:
+        print("Preset \"%s\" saved" % preset.get("name"))
+    return 0
+
+
+def cmd_delete(args):
+    data, exists = load_config()
+    if not exists:
+        raise PresetError("no presets file")
+    index, preset = find_preset(data, args.preset)
+    del data["presets"][index]
+    save_config(data)
+    print("Preset \"%s\" deleted (backup: presets.json.bak)" % (preset.get("name") or args.preset))
+    return 0
+
+
+def cmd_rename(args):
+    data, exists = load_config()
+    if not exists:
+        raise PresetError("no presets file")
+    name = " ".join(args.name.split())[:60]
+    if not name:
+        raise PresetError("the name is empty")
+    index, preset = find_preset(data, args.preset)
+    # Keep the id stable so keybindings that name it keep working.
+    preset["id"] = preset_id(preset, index)
+    preset["name"] = name
+    save_config(data)
+    print("Preset renamed to \"%s\"" % name)
+    return 0
+
+
+def cmd_move(args):
+    data, exists = load_config()
+    if not exists:
+        raise PresetError("no presets file")
+    index, preset = find_preset(data, args.preset)
+    presets = data["presets"]
+    preset["id"] = preset_id(preset, index)
+    target = max(0, min(len(presets) - 1, index + args.delta))
+    if target != index:
+        presets.insert(target, presets.pop(index))
+        save_config(data)
+    print(target + 1)
+    return 0
+
+
+def cmd_restore_hidden(args):
+    hypr = Hyprland()
+    restored = 0
+    for w in hypr.clients():
+        if not is_minimized(w):
+            continue
+        tags = [t for t in window_tags(w) if t.startswith(MINIMIZED_TAG_PREFIX)]
+        if not tags:
+            continue
+        ws = tags[0][len(MINIMIZED_TAG_PREFIX):]
+        for tag in tags:
+            hypr.dispatch("hl.dsp.window.tag({ tag = %s, window = %s })" % (lua_str("-" + tag), lua_str("address:" + w["address"])))
+        if hypr.dispatch("hl.dsp.window.move({ workspace = %s, follow = false, window = %s })" % (
+                lua_str(ws), lua_str("address:" + w["address"]))):
+            restored += 1
+    print("%d window(s) restored" % restored)
+    return 0
+
+
+def cmd_monitors(args):
+    mons = sorted_monitors(Hyprland().monitors())
+    names = position_names(len(mons))
+    for i, m in enumerate(mons):
+        print("%-7s  %-9s  %-14s  ws %-4s  %s" % (
+            names[i], m.get("name"), monitor_label(m), (m.get("activeWorkspace") or {}).get("id"), m.get("description", "")))
+    print("\nAccepted keys: left, middle/center, right, 1..N, name (DP-1), desc:<text> or a word from the model (e.g. Legion). French aliases (gauche, milieu, centre, droite) also work.")
+    return 0
+
+
+def cmd_path(args):
+    print(CONFIG_PATH)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="presetctl", description="Display presets for Hyprland / Omarchy")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("list", help="list presets")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("apply", help="apply a preset (id, name or number)")
+    p.add_argument("preset")
+    p.add_argument("--dry-run", action="store_true", help="show what would be done without changing anything")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--notify", action="store_true", help="notify on problems (for keyboard shortcuts)")
+    p.add_argument("--timeout", type=float, default=None, help="seconds to wait for launched windows")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser("capture", help="save the current layout as a preset")
+    p.add_argument("--name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("new", help="create an empty preset")
+    p.add_argument("--name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("show", help="a preset as the editor sees it")
+    p.add_argument("preset")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("save", help="save the editor's changes (JSON)")
+    p.add_argument("preset")
+    p.add_argument("--data", required=True, help="JSON : name, description, others, focus, screens")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_save)
+
+    p = sub.add_parser("delete", help="delete a preset")
+    p.add_argument("preset")
+    p.set_defaults(func=cmd_delete)
+
+    p = sub.add_parser("rename", help="rename a preset (the id does not change)")
+    p.add_argument("preset")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rename)
+
+    p = sub.add_parser("move", help="move a preset in the list (e.g. move work -1)")
+    p.add_argument("preset")
+    p.add_argument("delta", type=int)
+    p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser("restore-hidden", help="bring back windows a preset minimized")
+    p.set_defaults(func=cmd_restore_hidden)
+
+    p = sub.add_parser("monitors", help="show how screens are named")
+    p.set_defaults(func=cmd_monitors)
+
+    p = sub.add_parser("path", help="path of the presets file")
+    p.set_defaults(func=cmd_path)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except PresetError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        print("presetctl: " + str(exc), file=sys.stderr)
+        if getattr(args, "notify", False):
+            notify("Preset", str(exc), urgent=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

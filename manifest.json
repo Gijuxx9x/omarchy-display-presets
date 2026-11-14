@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "gijux9x.presets",
+  "name": "Display presets",
+  "version": "1.0.0",
+  "author": "gijux9x",
+  "license": "MIT",
+  "description": "One click puts your apps on the right screens: reuses open windows, launches what is missing.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Display presets",
+    "description": "Apply, capture and manage window layouts across all your screens.",
+    "category": "Compositor",
+    "aliases": [
+      "presets",
+      "layouts",
+      "screens",
+      "monitors",
+      "workspace"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
