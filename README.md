@@ -8,11 +8,6 @@ your apps live, switch between setups (work, focus, gaming...) in a click.
   <img src="media/panel.png" alt="The Display-Presets.9x panel listing two presets, each showing which apps go on the left, middle and right screens" width="460">
 </p>
 
-<p align="center">
-  <img src="media/demo.gif" alt="Opening the panel and applying the Travail preset: the missing YouTube window is launched on the left screen" width="700"><br>
-  <sub>Applying a preset: missing apps are launched on the screen they belong to.</sub>
-</p>
-
 - **Smart apply:** reuses windows that are already open and moves them to the
   right screen. It only launches what is missing, so pressing a preset twice
   changes nothing.
