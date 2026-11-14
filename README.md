@@ -9,8 +9,8 @@ your apps live, switch between setups (work, focus, gaming...) in a click.
 </p>
 
 <p align="center">
-  <img src="media/demo.gif" alt="Opening the panel and applying the Travail preset: the YouTube window moves onto the left screen" width="700"><br>
-  <sub>Applying a preset: the window lands on the screen it belongs to.</sub>
+  <img src="media/demo.gif" alt="Opening the panel and applying the Travail preset: the missing YouTube window is launched on the left screen" width="700"><br>
+  <sub>Applying a preset: missing apps are launched on the screen they belong to.</sub>
 </p>
 
 - **Smart apply:** reuses windows that are already open and moves them to the
