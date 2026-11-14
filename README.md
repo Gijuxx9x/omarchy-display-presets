@@ -202,6 +202,14 @@ panel.
   regex), so apps whose window class differs from their command name need a
   `class` regex.
 
+## Acknowledgements
+
+Thank you to [OldJobobo](https://github.com/OldJobobo) for the
+[Caroline Skyline](https://github.com/OldJobobo/omarchy-caroline-skyline-theme)
+Omarchy theme. The colors and the wallpaper in the screenshot above come from
+it, and it is the theme this plugin was built and tested with. The Caroline
+palette it is based on is by [ed](https://codeberg.org/ed).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
