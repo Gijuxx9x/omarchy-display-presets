@@ -1,12 +1,36 @@
 # Display-Presets.9x
 
-One click puts your apps on the right screens. A preset says which apps go on
-which monitor. Applying it **reuses the matching windows that are already
-open** (moving them where they belong) and **launches only what is missing**,
-so pressing the same preset twice changes nothing.
+**One click puts your apps on the right screens.**
+A multi-monitor layout manager for [Omarchy](https://omarchy.org): save where
+your apps live, switch between setups (work, focus, gaming...) in a click.
 
-An Omarchy bar widget with a panel, plus a small Python helper (`presetctl`)
-that does the window work through `hyprctl`.
+<!-- Add once media/panel.png exists:
+![The Display-Presets.9x panel listing three presets](media/panel.png)
+-->
+
+- **Smart apply:** reuses windows that are already open and moves them to the
+  right screen. It only launches what is missing, so pressing a preset twice
+  changes nothing.
+- **Capture your current layout** in one step, or build a preset from scratch
+  in the visual editor.
+- **Pin windows to exact places** with split layouts (free layout), not just
+  "somewhere on this screen".
+- **Hide the rest:** optionally minimize every window that is not part of the
+  preset, and bring them back with one click.
+- **Keyboard friendly:** `1`-`9` applies a preset directly, with `presetctl`
+  and IPC commands for your own keybindings.
+- **Safe to try:** `presetctl apply <id> --dry-run` shows what would happen.
+- **Follows your Omarchy theme.** English and French.
+
+## Quick start
+
+```sh
+omarchy plugin add <repository-url> --enable
+```
+
+1. Arrange your windows across your screens the way you like.
+2. Open the panel from the bar and press **New → Capture**.
+3. Next time, press `Enter` on that preset (or its number) and everything goes back.
 
 ## Install
 
