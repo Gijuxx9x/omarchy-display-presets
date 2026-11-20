@@ -427,7 +427,21 @@ Panel {
     if (target < 0 || target >= draftScreens.length) return
     var s = cloneScreens()
     var app = s[si].apps.splice(ai, 1)[0]
-    s[target].apps.push(app)
+    if (s[target].tiles) {
+      // A free layout has one window per tile: each window takes half of the last tile.
+      var tree = s[target].tiles
+      for (var i = 0; i < Math.max(1, Number(app.count || 1)); i++) {
+        var rects = tileRects(tree)
+        var last = rects[rects.length - 1].path
+        if (rects.length >= maxTiles || last.length >= 8) { showMessage(tr.t("tile.tooMany"), true); return }
+        var leaf = cloneOf(app)
+        delete leaf.count
+        tree = treeWithTile(tree, last, leaf, target)
+      }
+      s[target].tiles = tree
+    } else {
+      s[target].apps.push(app)
+    }
     draftScreens = s
     expandedKey = ""
     touch()
@@ -631,16 +645,19 @@ Panel {
     commitTree(si, withNode(draftScreens[si].tiles, path, function() { return app }), path)
   }
 
+  // The tree with `app` given half of the tile at `path`, along that tile's longer side.
+  function treeWithTile(tree, path, app, si) {
+    var rect = tileRects(tree).filter(function(r) { return r.path === path })[0]
+    var mon = monitors[si] || ({ width: 16, height: 9 })
+    var wide = !rect || rect.w * mon.width >= rect.h * mon.height
+    return withNode(tree, path, function(n) { return { split: wide ? "right" : "down", a: n, b: app } })
+  }
+
   // A new app takes half of the selected tile, along its longer side.
   function addTile(si, app) {
     var path = selectedPath(si)
-    var rect = tileRects(draftScreens[si].tiles).filter(function(r) { return r.path === path })[0]
-    var mon = monitors[si] || ({ width: 16, height: 9 })
-    var wide = !rect || rect.w * mon.width >= rect.h * mon.height
     if (tileRects(draftScreens[si].tiles).length >= maxTiles || path.length >= 8) { showMessage(tr.t("tile.tooMany"), true); return }
-    commitTree(si, withNode(draftScreens[si].tiles, path, function(n) {
-      return { split: wide ? "right" : "down", a: n, b: app }
-    }), path + "b")
+    commitTree(si, treeWithTile(draftScreens[si].tiles, path, app, si), path + "b")
   }
 
   // The tile under a point given as fractions of the screen, or null.
@@ -752,6 +769,19 @@ Panel {
   function shellQuote(text) {
     var t = String(text)
     return /^[A-Za-z0-9_@%+=:,.\/-]+$/.test(t) ? t : "'" + t.replace(/'/g, "'\\''") + "'"
+  }
+
+  // "env A=1 setsid foot -e htop" -> "foot": the program a command runs, for a default name.
+  function programName(command) {
+    var wrappers = ["uwsm-app", "uwsm", "app", "--", "setsid", "exec", "env", "nohup", "systemd-run", "-f", "--fork"]
+    var tokens = String(command || "").trim().split(/\s+/)
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i].replace(/^['"]+|['"]+$/g, "")
+      var base = t.split("/").pop()
+      if (t === "" || wrappers.indexOf(base) >= 0 || (t.indexOf("=") >= 0 && t.charAt(0) !== "-")) continue
+      return base
+    }
+    return "app"
   }
 
   function hostOf(url) {
@@ -873,15 +903,17 @@ Panel {
       cursorActive = false
       armedDeleteId = ""
       if (!applyProc.running) message = ""
+      if (editing && editorDirty) showMessage(tr.t("editor.restored"), false)
       refresh()
     } else {
       cancelEdit()
-      if (editing) {
+      pickerScreen = -1
+      pickerBrowser = null
+      editorLeaveArmed = false
+      // Unsaved changes survive a click outside the panel: reopening it brings them back.
+      if (editing && !editorDirty) {
         editing = false
         editorId = ""
-        editorDirty = false
-        editorLeaveArmed = false
-        pickerScreen = -1
       }
     }
   }
@@ -1026,6 +1058,8 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { root.handleText(t) }
+      // Reopened on a kept editor: the panel gives the keyboard to this catcher, the editor needs it.
+      onActiveFocusChanged: if (activeFocus && root.editing) Qt.callLater(function() { if (root.editing) editor.forceActiveFocus() })
 
       function endEdit() {
         root.cancelEdit()
@@ -2692,7 +2726,7 @@ Panel {
           bordered: true
           active: customForm.customExec.trim() !== ""
           enabled: customForm.customExec.trim() !== ""
-          onClicked: root.addApp(picker.screenIndex, { name: customForm.customName.trim() || customForm.customExec.trim().split(/\s+/).pop(), exec: customForm.customExec.trim() })
+          onClicked: root.addApp(picker.screenIndex, { name: customForm.customName.trim() || root.programName(customForm.customExec), exec: customForm.customExec.trim() })
         }
       }
     }

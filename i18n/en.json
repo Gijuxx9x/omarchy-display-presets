@@ -54,6 +54,7 @@
   "editor.focusNone": "None",
   "editor.noApps": "No apps: this screen is left alone.",
   "editor.unsaved": "Unsaved changes. Press again to discard them.",
+  "editor.restored": "Your unsaved changes are still here.",
   "editor.noName": "The preset needs a name.",
   "editor.keptScreens": "Screens not connected, kept as they are: %1",
   "editor.hint": "‹ › change screen · ↑ ↓ change order · ✎ details · Ctrl+S save · Esc back",

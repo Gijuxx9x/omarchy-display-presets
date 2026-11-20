@@ -54,6 +54,7 @@
   "editor.focusNone": "Aucun",
   "editor.noApps": "Aucune appli : cet écran ne sera pas touché.",
   "editor.unsaved": "Modifications non enregistrées. Appuie encore pour les abandonner.",
+  "editor.restored": "Tes modifications non enregistrées sont toujours là.",
   "editor.noName": "Le preset a besoin d'un nom.",
   "editor.keptScreens": "Écrans absents, conservés tels quels : %1",
   "editor.hint": "‹ › change d'écran · ↑ ↓ change l'ordre · ✎ détails · Ctrl+S enregistrer · Échap retour",

@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -55,6 +56,8 @@ PRESELECT = {"right": "r", "down": "d"}
 MAX_TILES = 16
 MAX_DEPTH = 10
 PARK_WORKSPACE = "special:presets-park"
+# A desktop id such as org.gnome.Nautilus or com.stremio.Stremio.
+REVERSE_DNS = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$")
 MATCH_TOLERANCE = 0.05
 
 # Screen keys a preset may use, in English or French.
@@ -238,6 +241,8 @@ def load_config(path=None):
     if not isinstance(data, dict) or not isinstance(data.get("presets", []), list):
         raise PresetError("presets.json must contain an object with a \"presets\" list")
     data.setdefault("presets", [])
+    if not all(isinstance(p, dict) for p in data["presets"]):
+        raise PresetError("every entry of \"presets\" must be an object")
     return data, True
 
 
@@ -534,7 +539,7 @@ def derive_classes(command):
     if not first:
         return []
     out = [first]
-    if re.match(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$", first):
+    if REVERSE_DNS.match(first):
         # A flatpak id (com.stremio.Stremio): many apps name their window after its last part.
         tail = first.rsplit(".", 1)[-1]
         out += [tail, tail.lower()]
@@ -558,10 +563,35 @@ def app_matcher(app):
         hint = re.sub(r"[\^\$\\]|\(\?i\)", "", cls)
     else:
         derived = derive_classes(app.get("exec", ""))
+        for extra in desktop_app_ids(app.get("exec", "")):
+            if extra.lower() not in [c.lower() for c in derived]:
+                derived.append(extra)
         if derived:
             cls = "^(?:" + "|".join(re.escape(c) for c in derived) + ")$"
             hint = derived[0]
     return cls, title, hint
+
+
+def desktop_app_ids(command):
+    """Desktop ids (org.gnome.Nautilus) of the entries that run exactly this command.
+
+    Wayland apps name their window after their desktop id, which the command
+    does not tell: nautilus opens org.gnome.Nautilus windows.
+    """
+    wanted = " ".join(strip_field_codes(command).split())
+    if not wanted:
+        return []
+    return [stem for stem, fields in desktop_index()
+            if REVERSE_DNS.match(stem) and " ".join(strip_field_codes(fields.get("Exec", "")).split()) == wanted]
+
+
+def check_app(app):
+    """A hand-edited app with a number where text belongs gets a clear error."""
+    for field in ("name", "exec", "class", "title", "icon"):
+        value = app.get(field)
+        if value is not None and not isinstance(value, str):
+            name = app.get("name") if isinstance(app.get("name"), str) else app.get("exec")
+            raise PresetError("\"%s\" of app \"%s\" must be text" % (field, name))
 
 
 def command_program(command):
@@ -647,6 +677,9 @@ def build_targets(preset, monitors):
         layout = screen.get("layout")
         if layout and layout not in LAYOUTS:
             raise PresetError("unknown layout \"%s\" (choices: %s)" % (layout, ", ".join(LAYOUTS)))
+        apps = screen_apps(screen)
+        for app in apps:
+            check_app(app)
         tree = clean_tree(screen["tiles"]) if screen.get("tiles") else None
         if tree is not None and not layout:
             # Pinning windows to places only means something in dwindle (a tree of
@@ -658,7 +691,7 @@ def build_targets(preset, monitors):
             "workspace": ws,
             "explicit": explicit,
             "layout": layout,
-            "apps": screen_apps(screen),
+            "apps": apps,
             "tree": tree,
         })
     return targets, unresolved
@@ -905,10 +938,32 @@ def arrange_target(hypr, target, slots, result, log):
                     put(w, workspace)
 
 
+def parked(clients):
+    """Windows a layout put aside and never brought back (the run was killed)."""
+    return [w for w in clients if (w.get("workspace") or {}).get("name") == PARK_WORKSPACE]
+
+
+def unpark(hypr, monitors, clients):
+    """Bring parked windows back to the workspace in front of the user."""
+    mon = next((m for m in monitors if m.get("focused")), None) or next(iter(sorted_monitors(monitors)), None)
+    workspace = str(((mon or {}).get("activeWorkspace") or {}).get("id", ""))
+    moved = 0
+    for w in parked(clients):
+        if workspace and hypr.dispatch("hl.dsp.window.move({ workspace = %s, follow = false, window = %s })" % (
+                lua_str(workspace), lua_str("address:" + w["address"]))):
+            moved += 1
+    return moved
+
+
 def apply_preset(preset, hypr, timeout=None, log=None):
     log = log or (lambda msg: None)
     monitors = hypr.monitors()
     clients = hypr.clients()
+    if parked(clients):
+        log("bringing back %d window(s) left aside by an interrupted layout" % len(parked(clients)))
+        unpark(hypr, monitors, clients)
+        if not hypr.dry_run:
+            clients = hypr.clients()
     targets, unresolved = build_targets(preset, monitors)
     if not targets:
         raise PresetError("none of this preset's screens matches a connected monitor")
@@ -1197,10 +1252,13 @@ def describe(data, monitors, clients, exists, path=None):
                 column.pop("rects", None)
         except PresetError as exc:
             entry["error"] = str(exc)
+        except Exception as exc:
+            # An odd value in a hand-edited file must not hide the other presets.
+            entry["error"] = "invalid preset: %s" % exc
         presets_out.append(entry)
 
     hidden = sum(1 for w in clients if is_minimized(w)
-                 and any(t.startswith(MINIMIZED_TAG_PREFIX) for t in window_tags(w)))
+                 and any(t.startswith(MINIMIZED_TAG_PREFIX) for t in window_tags(w))) + len(parked(clients))
     return {"config": path, "exists": exists, "error": "", "monitors": mon_out,
             "presets": presets_out, "hidden": hidden, "library": app_library(data)}
 
@@ -1685,8 +1743,9 @@ def cmd_move(args):
 
 def cmd_restore_hidden(args):
     hypr = Hyprland()
-    restored = 0
-    for w in hypr.clients():
+    clients = hypr.clients()
+    restored = unpark(hypr, hypr.monitors(), clients)
+    for w in clients:
         if not is_minimized(w):
             continue
         tags = [t for t in window_tags(w) if t.startswith(MINIMIZED_TAG_PREFIX)]
@@ -1779,6 +1838,10 @@ def main(argv=None):
     p.set_defaults(func=cmd_path)
 
     args = parser.parse_args(argv)
+    # Being stopped mid-layout must still bring the parked windows back (the
+    # finally in arrange_target), so these signals end the run like an error.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
     try:
         return args.func(args)
     except PresetError as exc:
