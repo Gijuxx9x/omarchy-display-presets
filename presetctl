@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -91,19 +92,63 @@ class Hyprland:
         self.log = log or (lambda msg: None)
         self.dispatched = []
 
-    def _json(self, what):
+    _socket_path = None
+
+    @classmethod
+    def socket_path(cls):
+        """Hyprland's request socket, or "" when it cannot be found."""
+        if cls._socket_path is None:
+            sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+            runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+            path = os.path.join(runtime, "hypr", sig, ".socket.sock") if sig else ""
+            cls._socket_path = path if path and os.path.exists(path) else ""
+        return cls._socket_path
+
+    def request(self, message):
+        """Send one request to Hyprland and return its reply as text.
+
+        Talks to the socket directly: an apply sends dozens of requests, and
+        starting a hyprctl process for each one is what made it feel slow.
+        Falls back to hyprctl when the socket is not reachable.
+        """
+        path = self.socket_path()
+        if path:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(5)
+                    sock.connect(path)
+                    sock.sendall(message.encode("utf-8"))
+                    chunks = []
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                return b"".join(chunks).decode("utf-8", "replace")
+            except OSError:
+                Hyprland._socket_path = ""
+        return self._hyprctl(message)
+
+    def _hyprctl(self, message):
+        json_flag = message.startswith("j/")
+        if json_flag:
+            message = message[2:]
+        verb, _, rest = message.partition(" ")
+        cmd = ["hyprctl"] + (["-j"] if json_flag else []) + [verb] + ([rest] if rest else [])
         try:
-            out = subprocess.run(["hyprctl", what, "-j"], capture_output=True, text=True, timeout=5)
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         except FileNotFoundError:
             raise PresetError("hyprctl not found: is Hyprland running?")
         except subprocess.TimeoutExpired:
             raise PresetError("hyprctl is not responding")
-        if out.returncode != 0:
-            raise PresetError("hyprctl %s failed: %s" % (what, out.stderr.strip()))
+        return out.stdout if out.returncode == 0 else (out.stdout + out.stderr or "error")
+
+    def _json(self, what):
+        text = self.request("j/" + what)
         try:
-            return json.loads(out.stdout)
+            return json.loads(text)
         except ValueError:
-            raise PresetError("hyprctl %s returned an unreadable response" % what)
+            raise PresetError("hyprctl %s returned an unreadable response: %s" % (what, text.strip()[:120]))
 
     def monitors(self):
         return self._json("monitors")
@@ -127,20 +172,30 @@ class Hyprland:
     def option_int(self, name):
         """Integer value of a Hyprland option, or None when it cannot be read."""
         try:
-            out = subprocess.run(["hyprctl", "getoption", "-j", name], capture_output=True, text=True, timeout=5)
-            return int(json.loads(out.stdout).get("int"))
-        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+            value = json.loads(self.request("j/getoption " + name))
+        except (OSError, ValueError, PresetError):
             return None
+        # Hyprland reports booleans as "bool", numbers as "int".
+        for key in ("int", "bool"):
+            if key in value:
+                try:
+                    return int(value[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
 
     def dispatch(self, lua):
         self.dispatched.append(lua)
         if self.dry_run:
             self.log("[dry-run] " + lua)
             return True
-        out = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True, timeout=5)
-        ok = out.returncode == 0 and out.stdout.strip().lower() in ("ok", "")
+        try:
+            reply = self.request("dispatch " + lua).strip()
+        except PresetError as exc:
+            reply = str(exc)
+        ok = reply.lower() in ("ok", "")
         if not ok:
-            self.log("dispatch refused: %s -> %s" % (lua, (out.stdout + out.stderr).strip()))
+            self.log("dispatch refused: %s -> %s" % (lua, reply))
         return ok
 
     def eval(self, lua):
@@ -148,8 +203,11 @@ class Hyprland:
         if self.dry_run:
             self.log("[dry-run] eval " + lua)
             return True
-        out = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True, timeout=5)
-        return out.returncode == 0
+        try:
+            reply = self.request("eval " + lua).strip()
+        except PresetError:
+            return False
+        return not reply.lower().startswith("error")
 
     def sleep(self, seconds):
         time.sleep(seconds)
@@ -415,6 +473,14 @@ def derive_class(command):
             continue
         if tok.endswith(".desktop"):
             return tok[: -len(".desktop")]
+        if base == "flatpak":
+            # flatpak run [options] <app id>: the window is named after the app id.
+            rest = tokens[i + 1:]
+            if rest and rest[0] == "run":
+                for arg in rest[1:]:
+                    if not arg.startswith("-") and not arg.startswith("@@"):
+                        return arg
+            return base
         if base == "omarchy-launch-webapp" and i + 1 < len(tokens):
             return webapp_class(tokens[i + 1])
         if base in ("omarchy-launch-or-focus-webapp",) and i + 2 < len(tokens):
@@ -434,6 +500,55 @@ def derive_class(command):
     return ""
 
 
+# The command a browser is started with is rarely the class its windows get
+# (helium-browser opens "helium" windows, google-chrome-stable "google-chrome").
+KNOWN_CLASSES = {
+    "helium-browser": ["helium"],
+    "helium": ["helium"],
+    "google-chrome-stable": ["google-chrome"],
+    "google-chrome-beta": ["google-chrome-beta"],
+    "google-chrome-unstable": ["google-chrome-unstable"],
+    "chromium-browser": ["chromium"],
+    "brave": ["brave-browser"],
+    "brave-browser": ["brave-browser"],
+    "brave-browser-beta": ["brave-browser-beta"],
+    "microsoft-edge-stable": ["microsoft-edge"],
+    "microsoft-edge-beta": ["microsoft-edge-beta"],
+    "vivaldi": ["vivaldi-stable"],
+    "zen-browser": ["zen", "zen-alpha", "zen-beta"],
+    "zen": ["zen", "zen-alpha", "zen-beta"],
+    "firefox-developer-edition": ["firefoxdeveloperedition", "firefox-developer-edition"],
+    "thorium-browser": ["thorium"],
+    "code": ["code", "code-oss", "Code"],
+    "code-oss": ["code-oss", "Code - OSS"],
+    "telegram-desktop": ["org.telegram.desktop"],
+    "spotify-launcher": ["spotify"],
+    "obsidian": ["obsidian"],
+}
+CLASS_SUFFIXES = ("-stable", "-browser", "-bin", "-desktop", "-launcher")
+
+
+def derive_classes(command):
+    """Every window class the exec line may produce, most likely first."""
+    first = derive_class(command)
+    if not first:
+        return []
+    out = [first]
+    if re.match(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$", first):
+        # A flatpak id (com.stremio.Stremio): many apps name their window after its last part.
+        tail = first.rsplit(".", 1)[-1]
+        out += [tail, tail.lower()]
+    for alias in KNOWN_CLASSES.get(first.lower(), []):
+        if alias not in out:
+            out.append(alias)
+    for suffix in CLASS_SUFFIXES:
+        if first.lower().endswith(suffix) and len(first) > len(suffix):
+            stripped = first[: -len(suffix)]
+            if stripped not in out:
+                out.append(stripped)
+    return out
+
+
 def app_matcher(app):
     """(class_regex, title_regex, class_hint) for an app entry."""
     cls = app.get("class") or ""
@@ -442,11 +557,32 @@ def app_matcher(app):
     if cls:
         hint = re.sub(r"[\^\$\\]|\(\?i\)", "", cls)
     else:
-        derived = derive_class(app.get("exec", ""))
+        derived = derive_classes(app.get("exec", ""))
         if derived:
-            cls = "^" + re.escape(derived) + "$"
-            hint = derived
+            cls = "^(?:" + "|".join(re.escape(c) for c in derived) + ")$"
+            hint = derived[0]
     return cls, title, hint
+
+
+def command_program(command):
+    """The program an exec line runs (wrappers skipped), or "" when unclear."""
+    tokens = exec_tokens(command)
+    for tok in tokens:
+        base = os.path.basename(tok)
+        if base in WRAPPERS or ("=" in tok and not tok.startswith("-")):
+            continue
+        return tok
+    return ""
+
+
+def command_installed(command):
+    """False only when the program of an exec line is known to be missing."""
+    program = command_program(command)
+    if not program or "$" in program or program.startswith("~"):
+        return True
+    if program.startswith("/"):
+        return os.path.exists(program)
+    return shutil.which(program) is not None
 
 
 def compile_regex(pattern, what, app_name):
@@ -633,7 +769,7 @@ def set_layout(hypr, target):
 
 
 def launch(hypr, slot):
-    command = (slot["app"].get("exec") or "").strip()
+    command = strip_field_codes(slot["app"].get("exec") or "")
     if not command:
         return False
     rule = "[workspace %s silent] " % slot["target"]["workspace"]
@@ -780,7 +916,7 @@ def apply_preset(preset, hypr, timeout=None, log=None):
     # Arranging tiles has to focus windows; the user's own focus is put back after.
     active = next((w for w in clients if w.get("focusHistoryID") == 0 and not is_minimized(w)), None)
     result = {"ok": True, "moved": 0, "launched": 0, "kept": 0, "hidden": 0,
-              "missing": [], "warnings": [], "unresolved": unresolved}
+              "missing": [], "notInstalled": [], "warnings": [], "unresolved": unresolved}
     for key in unresolved:
         result["warnings"].append("screen \"%s\" not found, skipped" % key)
 
@@ -828,6 +964,11 @@ def apply_preset(preset, hypr, timeout=None, log=None):
         if slot["window"] is None:
             if not (slot["app"].get("exec") or "").strip():
                 result["warnings"].append("\"%s\" has no exec command" % slot["name"])
+                continue
+            if not command_installed(slot["app"]["exec"]):
+                program = command_program(slot["app"]["exec"])
+                result["warnings"].append("\"%s\" is not installed (%s not found)" % (slot["name"], program))
+                result["notInstalled"].append(slot["name"])
                 continue
             log("launching %s on workspace %s" % (slot["name"], slot["target"]["workspace"]))
             if launch(hypr, slot):
@@ -932,6 +1073,9 @@ def app_library(data):
         if not isinstance(app, dict) or not str(app.get("exec") or "").strip():
             return
         command = " ".join(str(app["exec"]).split())
+        if not command_installed(command):
+            # Uninstalled since the preset was made: do not offer it again.
+            return
         key = (command, str(app.get("title") or ""))
         extra = {k: app[k] for k in ("class", "icon") if app.get(k)}
         if key in seen:
@@ -1031,6 +1175,7 @@ def describe(data, monitors, clients, exists, path=None):
                         "name": str(name),
                         "count": count,
                         "present": min(present, count),
+                        "installed": command_installed(app.get("exec", "")),
                         "icon": str(app.get("icon") or hint),
                     })
                 column["rects"] = [r for _, r in tile_rects(t["tree"])] if t["tree"] is not None else None
@@ -1039,7 +1184,8 @@ def describe(data, monitors, clients, exists, path=None):
                 windows = []
                 for app in column["apps"]:
                     for n in range(app["count"]):
-                        windows.append({"name": app["name"], "icon": app["icon"], "present": n < app["present"]})
+                        windows.append({"name": app["name"], "icon": app["icon"], "present": n < app["present"],
+                                        "installed": app["installed"]})
                 if column.get("rects"):
                     column["tiles"] = []
                     for win, (x, y, w, h) in zip(windows, column["rects"]):
@@ -1069,19 +1215,29 @@ def desktop_dirs():
     return [os.path.join(d, "applications") for d in dirs if d]
 
 
-def desktop_entry_for_class(klass):
-    """{exec, name, icon} of the desktop entry that claims a window class."""
-    if not klass:
-        return {}
-    wanted = klass.lower()
+_DESKTOP_INDEX = None
+
+
+def desktop_index():
+    """[(file stem, fields)] of every visible desktop entry, read once per run.
+
+    A capture looks up one entry per window; reading every .desktop file again
+    for each of them was the slow part.
+    """
+    global _DESKTOP_INDEX
+    if _DESKTOP_INDEX is not None:
+        return _DESKTOP_INDEX
+    index, seen = [], set()
     for directory in desktop_dirs():
         try:
             names = sorted(os.listdir(directory))
         except OSError:
             continue
         for name in names:
-            if not name.endswith(".desktop"):
+            # An entry in ~/.local/share hides the one with the same name further down.
+            if not name.endswith(".desktop") or name in seen:
                 continue
+            seen.add(name)
             fields = {}
             try:
                 with open(os.path.join(directory, name), encoding="utf-8", errors="replace") as fh:
@@ -1095,12 +1251,49 @@ def desktop_entry_for_class(klass):
                             fields.setdefault(k.strip(), v.strip())
             except OSError:
                 continue
-            wm = fields.get("StartupWMClass", "").lower()
-            if wm == wanted or name[: -len(".desktop")].lower() == wanted:
-                command = re.sub(r"\s*%[fFuUdDnNickvm]", "", fields.get("Exec", "")).strip()
-                if command:
-                    return {"exec": command, "name": fields.get("Name", ""), "icon": fields.get("Icon", "")}
+            if fields.get("Hidden", "").lower() == "true":
+                continue
+            index.append((name[: -len(".desktop")], fields))
+    _DESKTOP_INDEX = index
+    return index
+
+
+def desktop_entry_for_class(klass):
+    """{exec, name, icon} of the desktop entry that claims a window class."""
+    if not klass:
+        return {}
+    wanted = klass.lower()
+    matches = []
+    for stem, fields in desktop_index():
+        wm = fields.get("StartupWMClass", "").lower()
+        if wm == wanted:
+            matches.insert(0, fields)
+        elif stem.lower() == wanted:
+            matches.append(fields)
+    for fields in matches:
+        command = strip_field_codes(fields.get("Exec", "")).strip()
+        if command and command_installed(command):
+            return {"exec": command, "name": fields.get("Name", ""), "icon": fields.get("Icon", "")}
+    # A browser started from its own entry: helium windows come from helium-browser.
+    for stem, fields in desktop_index():
+        command = strip_field_codes(fields.get("Exec", "")).strip()
+        if command and wanted in [c.lower() for c in derive_classes(command)[1:]] and command_installed(command):
+            return {"exec": command, "name": fields.get("Name", ""), "icon": fields.get("Icon", "")}
     return {}
+
+
+def webapp_url(cmdline):
+    """The address of a Chromium --app window's command line, or ""."""
+    for tok in exec_tokens(cmdline):
+        if tok.startswith("--app="):
+            return tok[len("--app="):]
+    return ""
+
+
+def strip_field_codes(command):
+    """An Exec= line without %U-style codes and flatpak's @@u ... @@ markers."""
+    command = re.sub(r"\s*%[fFuUdDnNickvm](?=\s|$)", "", str(command or ""))
+    return re.sub(r"\s*@@[uU]?(?=\s|$)", "", command).strip()
 
 
 def proc_cmdline(pid):
@@ -1115,7 +1308,12 @@ def proc_cmdline(pid):
 def app_from_window(window):
     klass = window.get("class") or window.get("initialClass") or ""
     entry = desktop_entry_for_class(klass)
-    command = entry.get("exec") or proc_cmdline(window.get("pid")) or klass
+    cmdline = "" if entry.get("exec") else proc_cmdline(window.get("pid"))
+    url = webapp_url(cmdline) if klass.startswith("chrome-") else ""
+    if url:
+        # A web app: relaunch it the way Omarchy does, in whatever browser is the default.
+        cmdline = "omarchy-launch-webapp " + shlex.quote(url)
+    command = entry.get("exec") or cmdline or klass
     name = entry.get("name") or (klass[len("chrome-"):].split("_")[0] if klass.startswith("chrome-") else klass)
     app = {"name": name, "exec": command, "class": "^" + re.escape(klass) + "$", "count": 1}
     if entry.get("icon"):

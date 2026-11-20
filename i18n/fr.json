@@ -93,13 +93,16 @@
   "tile.tooMany": "Trop de tuiles pour cet écran.",
   "tile.hint": "Glisse une tuile sur une autre pour la déplacer : sur un bord, elle se place à côté ; au centre, elles échangent leur place. Ou clique-la pour la couper, changer son appli, ajuster sa taille.",
   "app.yours": "Tes commandes",
-  "browser.title": "%1 : quelle adresse ouvrir ?",
-  "browser.placeholder": "Adresse, par exemple youtube.com",
+  "browser.title": "%1 : quelle adresse ouvrir ? (facultatif)",
+  "browser.placeholder": "Adresse (facultatif), par exemple youtube.com",
   "browser.webapp": "Application web",
   "browser.window": "Fenêtre normale",
   "browser.webappTip": "Sans barre d'adresse ni onglets, comme tes YouTube ou Discord",
   "browser.windowTip": "Une fenêtre du navigateur avec ses onglets",
   "browser.webappHint": "Fenêtre sans barre d'adresse, reconnue par son adresse : le preset la retrouve et ne la rouvre pas en double. Ouverte par le navigateur Chromium par défaut d'Omarchy.",
   "browser.windowHint": "Fenêtre normale du navigateur. Le preset la retrouve par le navigateur, pas par l'adresse : ne mets pas deux fenêtres du même navigateur avec des adresses différentes si tu veux les distinguer.",
-  "browser.badUrl": "Il faut une adresse web, par exemple youtube.com"
+  "browser.blankHint": "Sans adresse : une nouvelle fenêtre vide de ce navigateur, sur sa page d'accueil. Le preset réutilise une fenêtre déjà ouverte du navigateur au lieu de l'ouvrir en double.",
+  "browser.badUrl": "Ce n'est pas une adresse web valide, par exemple youtube.com",
+  "app.webapp": "Application web",
+  "app.notInstalled": "%1 (non installé)"
 }

@@ -93,13 +93,16 @@
   "tile.tooMany": "Too many tiles for this screen.",
   "tile.hint": "Drag a tile onto another to move it: on an edge it goes beside it; in the middle the two swap. Or click it to split it, change its app or adjust its size.",
   "app.yours": "Your commands",
-  "browser.title": "%1: which address to open?",
-  "browser.placeholder": "Address, for example youtube.com",
+  "browser.title": "%1: which address to open? (optional)",
+  "browser.placeholder": "Address (optional), for example youtube.com",
   "browser.webapp": "Web app",
   "browser.window": "Normal window",
   "browser.webappTip": "No address bar or tabs, like your YouTube or Discord",
   "browser.windowTip": "A browser window with its tabs",
-  "browser.webappHint": "A window without address bar, recognised by its address: the preset finds it again and never opens it twice. Opened by Omarchy's default Chromium browser.",
+  "browser.webappHint": "A window without address bar, recognised by its address: the preset finds it again and never opens it twice. Opened by your default browser (Helium, Chromium, Chrome, Brave…).",
   "browser.windowHint": "A normal browser window. The preset finds it by the browser, not by the address: do not put two windows of the same browser with different addresses if you need to tell them apart.",
-  "browser.badUrl": "A web address is needed, for example youtube.com"
+  "browser.blankHint": "No address: a new empty window of this browser, opened on its start page. The preset reuses an open window of the browser instead of opening it twice.",
+  "browser.badUrl": "That is not a valid web address, for example youtube.com",
+  "app.webapp": "Web app",
+  "app.notInstalled": "%1 (not installed)"
 }

@@ -166,11 +166,24 @@ Panel {
     refresh()
   }
 
+  property var actionQueue: []
+
   function run(args, after) {
-    if (actionProc.running) return
+    if (actionProc.running) {
+      // A click made while another action runs is done right after it, not lost.
+      actionQueue = actionQueue.concat([{ args: args, after: after || null }])
+      return
+    }
     actionAfter = after || null
     actionProc.command = ["python3", root.ctl].concat(args)
     actionProc.running = true
+  }
+
+  function runNext() {
+    if (actionQueue.length === 0 || actionProc.running) return
+    var next = actionQueue[0]
+    actionQueue = actionQueue.slice(1)
+    run(next.args, next.after)
   }
 
   function startCapture() {
@@ -712,7 +725,7 @@ Panel {
       ;["class", "title", "icon"].forEach(function(k) { if (e[k]) own[k] = String(e[k]) })
       return own
     }
-    var command = String(e.execString || "").replace(/\s*%[fFuUdDnNickvm]/g, "").trim()
+    var command = String(e.execString || "").replace(/\s*%[fFuUdDnNickvm](?=\s|$)/g, "").replace(/\s*@@[uU]?(?=\s|$)/g, "").trim()
     var app = { name: String(e.name || e.id), exec: command }
     if (e.runInTerminal) {
       // Same launcher Omarchy's own menu uses: the window is named org.omarchy.<command>.
@@ -757,7 +770,14 @@ Panel {
     return /chrom|chrome|brave|edge|opera|vivaldi|helium/i.test(String(e.execString || "") + " " + String(e.id || ""))
   }
 
+  // `url` is "" for a plain browser window with no address: the browser opens on its own start page.
   function appFromBrowser(e, url, webapp) {
+    if (url === "") {
+      var blank = appFromEntry(e)
+      blank.name = String(e.name)
+      blank.exec = blank.exec + " --new-window"
+      return blank
+    }
     var host = hostOf(url)
     if (webapp) {
       var app = { name: host, exec: "omarchy-launch-webapp " + shellQuote(url) }
@@ -780,9 +800,10 @@ Panel {
 
   // `typed` is what the address field holds right now; it is the source of truth.
   function confirmBrowser(si, typed) {
-    var url = normalizeUrl(typed !== undefined ? typed : pickerUrl)
-    if (!pickerBrowser || url === "") { showMessage(tr.t("browser.badUrl"), true); return false }
-    var app = appFromBrowser(pickerBrowser, url, pickerWebapp && canBeWebapp(pickerBrowser))
+    var text = String(typed !== undefined ? typed : pickerUrl).trim()
+    var url = text === "" ? "" : normalizeUrl(text)
+    if (!pickerBrowser || (text !== "" && url === "")) { showMessage(tr.t("browser.badUrl"), true); return false }
+    var app = appFromBrowser(pickerBrowser, url, url !== "" && pickerWebapp && canBeWebapp(pickerBrowser))
     pickerBrowser = null
     addApp(si, app)
     return true
@@ -802,11 +823,15 @@ Panel {
     }).map(function(a) {
       return Object.assign({}, a, { lib: true, genericName: tr.t("app.yours") })
     })
+    var known = {}
+    mine.forEach(function(a) { known[String(a.exec)] = true })
     var values = DesktopEntries.applications.values || []
     var out = []
     for (var i = 0; i < values.length; i++) {
       var e = values[i]
       if (!e || e.noDisplay || !e.execString) continue
+      var command = String(e.execString).replace(/\s*%[fFuUdDnNickvm](?=\s|$)/g, "").replace(/\s*@@[uU]?(?=\s|$)/g, "").trim()
+      if (known[command]) continue
       var hay = (String(e.name) + " " + String(e.genericName || "") + " " + String(e.id)).toLowerCase()
       if (q !== "" && hay.indexOf(q) < 0) continue
       out.push(e)
@@ -914,16 +939,28 @@ Panel {
         })
       }
       if (after) after(exitCode === 0)
-      root.refresh()
+      if (root.actionQueue.length > 0) Qt.callLater(root.runNext)
+      else root.refresh()
     }
   }
 
   function tr_failed() { return tr.t("error.failed") }
 
+  readonly property var layoutEvents: ({
+    openwindow: true, closewindow: true, movewindow: true, movewindowv2: true,
+    createworkspace: true, createworkspacev2: true, destroyworkspace: true, destroyworkspacev2: true,
+    workspace: true, workspacev2: true, focusedmon: true, focusedmonv2: true, moveworkspace: true, moveworkspacev2: true,
+    monitoradded: true, monitoraddedv2: true, monitorremoved: true, monitorremovedv2: true,
+    changefloatingmode: true, minimized: true, windowtitlev2: false
+  })
+
   // Windows opening, closing or moving change which preset is active.
   Connections {
     target: Hyprland
-    function onRawEvent(event) { if (root.opened) refreshDebounce.restart() }
+    function onRawEvent(event) {
+      // Title and focus changes fire constantly (a video player, a chat): they do not move windows.
+      if (root.opened && event && root.layoutEvents[String(event.name)] === true) refreshDebounce.restart()
+    }
   }
 
   Timer { id: refreshDebounce; interval: 400; onTriggered: root.refresh() }
@@ -1482,7 +1519,7 @@ Panel {
     property bool busy: false
 
     width: Math.round(16 * unit)
-    height: Math.round(12 * unit)
+    height: Math.round(16 * unit)
 
     Row {
       id: screensRow
@@ -1490,7 +1527,7 @@ Panel {
       spacing: Math.max(1, Math.round(glyph.unit))
 
       Repeater {
-        model: [{ w: 4, h: 7, lit: false }, { w: 6, h: 10, lit: true }, { w: 4, h: 7, lit: false }]
+        model: [{ w: 4, h: 11, lit: false }, { w: 6, h: 15, lit: true }, { w: 4, h: 11, lit: false }]
         Rectangle {
           required property var modelData
           anchors.verticalCenter: parent.verticalCenter
@@ -1740,7 +1777,8 @@ Panel {
                   // Windows already open are filled; the ones the preset will launch are hollow.
                   color: modelData.present ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.16) : "transparent"
                   border.width: 1
-                  border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, modelData.present ? 0.45 : 0.3)
+                  border.color: modelData.installed === false ? Commons.Color.urgent
+                    : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, modelData.present ? 0.45 : 0.3)
 
                   Column {
                     anchors.centerIn: parent
@@ -1784,7 +1822,8 @@ Panel {
                       visible: tile.roomForName
                       width: parent.width
                       horizontalAlignment: Text.AlignHCenter
-                      text: tile.modelData.name
+                      text: tile.modelData.installed === false ? tr.t("app.notInstalled").arg(tile.modelData.name) : tile.modelData.name
+                      color: tile.modelData.installed === false ? Commons.Color.urgent : root.fg
                       font.pixelSize: Math.max(8, Style.font.caption - 1)
                     }
                   }
@@ -2417,7 +2456,7 @@ Panel {
     function addCurrent() {
       var hits = root.pickerResults(root.pickerQuery, root.appsRev)
       var i = results.currentIndex
-      if (root.pickerQuery.trim() !== "" && i >= 0 && i < hits.length) root.chooseEntry(picker.screenIndex, hits[i])
+      if (i >= 0 && i < hits.length) root.chooseEntry(picker.screenIndex, hits[i])
     }
 
     Column {
@@ -2526,7 +2565,8 @@ Panel {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
-            text: String(hit.modelData.name) + (hit.modelData.genericName ? "  ·  " + String(hit.modelData.genericName) : "")
+            text: String(hit.modelData.name) + (hit.modelData.genericName ? "  ·  " + String(hit.modelData.genericName)
+              : (/^omarchy-launch-webapp\b/.test(String(hit.modelData.execString || "")) ? "  ·  " + tr.t("app.webapp") : ""))
           }
         }
       }
@@ -2572,7 +2612,7 @@ Panel {
 
         Row {
           spacing: Style.space(6)
-          visible: !!root.pickerBrowser && root.canBeWebapp(root.pickerBrowser)
+          visible: !!root.pickerBrowser && root.canBeWebapp(root.pickerBrowser) && urlField.text.trim() !== ""
 
           Button {
             text: tr.t("browser.webapp")
@@ -2601,7 +2641,8 @@ Panel {
           wrapMode: Text.WordWrap
           color: root.faintFg
           font.pixelSize: Style.font.caption
-          text: root.pickerBrowser && root.canBeWebapp(root.pickerBrowser) && root.pickerWebapp ? tr.t("browser.webappHint") : tr.t("browser.windowHint")
+          text: urlField.text.trim() === "" ? tr.t("browser.blankHint")
+            : (root.pickerBrowser && root.canBeWebapp(root.pickerBrowser) && root.pickerWebapp ? tr.t("browser.webappHint") : tr.t("browser.windowHint"))
         }
 
         Row {
@@ -2613,7 +2654,7 @@ Panel {
             foreground: root.fg
             fontFamily: root.fontFamily
             bordered: true
-            active: root.normalizeUrl(urlField.text) !== ""
+            active: urlField.text.trim() === "" || root.normalizeUrl(urlField.text) !== ""
             onClicked: root.confirmBrowser(picker.screenIndex, urlField.text)
           }
           Button {
